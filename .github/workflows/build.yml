@@ -74,7 +74,7 @@ jobs:
       - name: Checkout packaging templates (ci)
         uses: actions/checkout@v4
         with:
-          ref: experiment/gtk-4.24.1-ci
+          ref: gtk-4.24.1-ci
           sparse-checkout: packaging/debian
           path: _ci
 
