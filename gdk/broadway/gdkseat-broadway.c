@@ -53,7 +53,7 @@ gdk_broadway_seat_dispose (GObject *object)
   if (priv->logical_keyboard)
     {
       gdk_seat_device_removed (GDK_SEAT (seat), priv->logical_keyboard);
-      g_clear_object (&priv->logical_pointer);
+      g_clear_object (&priv->logical_keyboard);
     }
 
   for (l = priv->physical_pointers; l; l = l->next)

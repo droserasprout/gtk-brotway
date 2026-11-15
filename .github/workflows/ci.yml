@@ -1,0 +1,17 @@
+# Validation build for this fork branch: on every push, build the Broadway .deb
+# (amd64 + arm64) via the reusable workflow on the `ci` branch and upload it as a
+# workflow artifact. No GitHub Release is published here.
+name: CI
+
+on:
+  push:
+    branches: [4.24.1-brotway]
+
+jobs:
+  build:
+    uses: droserasprout/gtk-brotway/.github/workflows/build.yml@ci
+    with:
+      ref: ${{ github.sha }}
+      gtk: "4.24.1"
+      container: "ubuntu:26.10"
+      demos: "-Dbuild-demos=false"

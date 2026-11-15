@@ -31,6 +31,7 @@
 #include "gtkcsscolorvalueprivate.h"
 
 #include "gdk/gdkdisplayprivate.h"
+#include "gdk/broadway/broadway-env.h"   /* broadway_env_flag () */
 
 #include <string.h>
 
@@ -303,6 +304,13 @@ gtk_settings_init (GtkSettings *settings)
   path = g_build_filename (g_get_user_config_dir (), "gtk-4.0", "settings.ini", NULL);
   gtk_settings_load_from_key_file (settings, path, GTK_SETTINGS_SOURCE_DEFAULT);
   g_free (path);
+
+  /* Override animations, including the reduced-motion SVG spinner in 4.24. */
+  if (broadway_env_flag ("BROTWAY_NO_ANIMATIONS", FALSE))
+    g_object_set (settings,
+                  "gtk-enable-animations", FALSE,
+                  "gtk-interface-reduced-motion", GTK_REDUCED_MOTION_REDUCE,
+                  NULL);
 
   g_object_thaw_notify (G_OBJECT (settings));
 

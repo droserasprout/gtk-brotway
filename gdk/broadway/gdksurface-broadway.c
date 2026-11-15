@@ -39,10 +39,12 @@
 #include "gdkpopupprivate.h"
 #include "gdkprofilerprivate.h"
 #include "gdkprivate-broadway.h"
+#include "broadway-env.h"
 #include "gdkseatprivate.h"
 #include "gdksurfaceprivate.h"
 #include "gdktextureprivate.h"
 #include "gdktoplevelprivate.h"
+#include "loaders/gdkpngprivate.h"
 
 #include <graphene.h>
 #include <stdlib.h>
@@ -245,10 +247,15 @@ gdk_broadway_surface_constructed (GObject *object)
     broadway_display->toplevels = g_list_prepend (broadway_display->toplevels, self);
 
   self->resizible = TRUE;
+
+  /* Only popups (menus/popovers) carry a parent surface; toplevels — including
+   * transient dialogs set via gtk_window_set_transient_for() — do not. The
+   * daemon needs this to avoid stealing keyboard focus to popups on touch. */
   self->id = _gdk_broadway_server_new_surface (broadway_display->server,
                                                self->root_x,
                                                self->root_y,
-                                               1, 1);
+                                               1, 1,
+                                               surface->parent != NULL);
   g_hash_table_insert (broadway_display->id_ht, GINT_TO_POINTER (self->id), surface);
 
   g_object_ref (self);
@@ -256,6 +263,14 @@ gdk_broadway_surface_constructed (GObject *object)
   G_OBJECT_CLASS (gdk_broadway_surface_parent_class)->constructed (object);
 
   connect_frame_clock (surface);
+
+  /* Born while the tab is hidden: freeze it too, so it doesn't render a frame
+   * behind the user's back. Balanced by the thaw in set_suspended(FALSE). */
+  if (broadway_display->suspended)
+    {
+      self->suspend_frozen = TRUE;
+      gdk_surface_freeze_updates (surface);
+    }
 }
 
 static void
@@ -277,6 +292,10 @@ gdk_broadway_surface_finalize (GObject *object)
   if (impl->cursor)
     g_object_unref (impl->cursor);
 
+  g_free (impl->cursor_name);
+  g_free (impl->title);
+  g_clear_pointer (&impl->icon_png, g_bytes_unref);
+
   broadway_display->toplevels = g_list_remove (broadway_display->toplevels, impl);
 
   G_OBJECT_CLASS (gdk_broadway_surface_parent_class)->finalize (object);
@@ -297,6 +316,7 @@ _gdk_broadway_roundtrip_notify (GdkSurface  *surface,
 {
   GdkBroadwaySurface *impl = GDK_BROADWAY_SURFACE (surface);
   GdkFrameClock *clock = gdk_surface_get_frame_clock (surface);
+  GdkFrameTimings *timings;
 
   /* If there is no remote web client, rate limit update to once a second */
   if (local_reply)
@@ -304,9 +324,13 @@ _gdk_broadway_roundtrip_notify (GdkSurface  *surface,
   else
     gdk_surface_thaw_updates (surface);
 
-  gdk_frame_clock_submitted (clock,
-                             impl->pending_frame_counter,
-                             G_NSEC_PER_SEC / 30); /* default to 1/30th of a second */
+  /* Popups share their parent's clock. Submit each painted frame once;
+   * update-only frames have already been marked skipped by the clock. */
+  timings = gdk_frame_clock_get_timings (clock, impl->pending_frame_counter);
+  if (timings && gdk_frame_timings_get_result (timings) == GDK_FRAME_OUTSTANDING)
+    gdk_frame_clock_submitted (clock,
+                              impl->pending_frame_counter,
+                              G_NSEC_PER_SEC / 30);
 
   impl->pending_frame_counter = 0;
 }
@@ -577,7 +601,25 @@ gdk_broadway_surface_layout_popup (GdkSurface     *surface,
 
   monitor = gdk_surface_get_layout_monitor (surface, layout,
                                             gdk_monitor_get_geometry);
-  gdk_monitor_get_geometry (monitor, &bounds);
+  if (monitor)
+    gdk_monitor_get_geometry (monitor, &bounds);
+  else
+    /* Anchor outside the single monitor -> get_monitor_for_rect returns NULL. Use
+       unconstrained bounds (like the toplevel path) so the popup lands at its
+       anchor; passing NULL to gdk_monitor_get_geometry asserts + leaves it garbage. */
+    bounds = (GdkRectangle) { 0, 0, G_MAXINT, G_MAXINT };
+
+  /* Populate the shadow margin from the popup layout, like X11/Wayland do.
+     compute_toplevel_size() only sets impl->shadow_* for toplevels, so without
+     this a popup's shadow stays 0: the helper can't shift the surface origin to
+     cancel the shadow the renderer bakes into the contents node, and the popover
+     lands offset by the shadow extent (the app's "popover > contents {
+     box-shadow: none }" CSS hack worked around exactly this). */
+  gdk_popup_layout_get_shadow_width (layout,
+                                     &impl->shadow_left,
+                                     &impl->shadow_right,
+                                     &impl->shadow_top,
+                                     &impl->shadow_bottom);
 
   gdk_surface_layout_popup_helper (surface,
                                    width,
@@ -677,6 +719,86 @@ static void
 gdk_broadway_surface_set_title (GdkSurface  *surface,
                                 const char *title)
 {
+  GdkBroadwayDisplay *display;
+  GdkBroadwaySurface *impl = GDK_BROADWAY_SURFACE (surface);
+
+  if (title == NULL)
+    title = "";
+
+  /* -> browser document/tab title; dedup repeats. */
+  if (g_strcmp0 (impl->title, title) == 0)
+    return;
+
+  g_free (impl->title);
+  impl->title = g_strdup (title);
+
+  display = GDK_BROADWAY_DISPLAY (gdk_surface_get_display (surface));
+  _gdk_broadway_server_surface_set_title (display->server, impl->id, title);
+}
+
+/* Window icon -> favicon. GTK hands the themed icon-name to us as GdkTextures;
+ * pick a small one, PNG-encode it, ship the bytes. NULL list clears it. */
+static void
+gdk_broadway_surface_set_icon_list (GdkSurface *surface,
+                                    GList      *textures)
+{
+  GdkBroadwayDisplay *display;
+  GdkBroadwaySurface *impl = GDK_BROADWAY_SURFACE (surface);
+  GdkTexture *best = NULL;
+  int best_w = 0;
+  GBytes *png;
+  const guchar *data;
+  gsize len;
+  GList *l;
+
+  display = GDK_BROADWAY_DISPLAY (gdk_surface_get_display (surface));
+
+  if (textures == NULL)
+    {
+      if (impl->icon_png == NULL)
+        return;
+      g_clear_pointer (&impl->icon_png, g_bytes_unref);
+      _gdk_broadway_server_surface_set_icon (display->server, impl->id, NULL, 0);
+      return;
+    }
+
+  /* Largest texture <= 64px; if all are bigger, the smallest. */
+  for (l = textures; l != NULL; l = l->next)
+    {
+      GdkTexture *t = l->data;
+      int w;
+
+      if (!GDK_IS_TEXTURE (t))   /* defensive: the prop is typed GList of textures */
+        continue;
+      w = gdk_texture_get_width (t);
+
+      if (best == NULL ||
+          (w <= 64 && (best_w > 64 || w > best_w)) ||
+          (best_w > 64 && w < best_w))
+        {
+          best = t;
+          best_w = w;
+        }
+    }
+
+  if (best == NULL)   /* no usable texture in the list */
+    return;
+
+  png = gdk_save_png (best, NULL);
+  if (png == NULL)
+    return;
+
+  if (impl->icon_png && g_bytes_equal (impl->icon_png, png))
+    {
+      g_bytes_unref (png);
+      return;
+    }
+
+  g_clear_pointer (&impl->icon_png, g_bytes_unref);
+  impl->icon_png = png;
+
+  data = g_bytes_get_data (png, &len);
+  _gdk_broadway_server_surface_set_icon (display->server, impl->id, data, len);
 }
 
 static void
@@ -723,6 +845,28 @@ gdk_broadway_surface_set_modal_hint (GdkSurface *surface,
   display = GDK_BROADWAY_DISPLAY (gdk_surface_get_display (surface));
   _gdk_broadway_server_surface_set_modal_hint (display->server, impl->id, impl->modal_hint);
  }
+
+/**
+ * gdk_broadway_surface_set_keep_above:
+ * @surface: a broadway `GdkSurface`
+ * @keep_above: whether to pin the surface above normal ones
+ *
+ * Pins @surface always-on-top (and exempt from menu-grab confinement, so it
+ * stays interactive while another surface holds a popup grab).
+ */
+void
+gdk_broadway_surface_set_keep_above (GdkSurface *surface,
+                                     gboolean    keep_above)
+{
+  GdkBroadwayDisplay *display;
+  GdkBroadwaySurface *impl;
+
+  g_return_if_fail (GDK_IS_BROADWAY_SURFACE (surface));
+
+  impl = GDK_BROADWAY_SURFACE (surface);
+  display = GDK_BROADWAY_DISPLAY (gdk_surface_get_display (surface));
+  _gdk_broadway_server_surface_set_keep_above (display->server, impl->id, keep_above);
+}
 
 static void
 gdk_broadway_surface_get_geometry (GdkSurface *surface,
@@ -784,6 +928,34 @@ static void
 gdk_broadway_surface_set_input_region (GdkSurface     *surface,
                                        cairo_region_t *shape_region)
 {
+  GdkBroadwaySurface *impl = GDK_BROADWAY_SURFACE (surface);
+  GdkBroadwayDisplay *broadway_display;
+  cairo_rectangle_int_t ext = { 0, 0, 0, 0 };
+  int mode;
+
+  if (GDK_SURFACE_DESTROYED (surface))
+    return;
+
+  /* Forward the input region so the client only takes pointer events inside it.
+   * Broadway can't carry an arbitrary shape, but the cases that matter are
+   * rectangular: an empty region is a click-through surface (e.g. GtkTextHandle),
+   * and a popover's region is its content rect - everything outside (the shadow
+   * margin) must pass clicks through. We send the region's bounding box; the
+   * shadow lies entirely outside it. NULL means no region (whole surface). */
+  if (shape_region == NULL)
+    mode = 0; /* whole surface interactive */
+  else if (cairo_region_is_empty (shape_region))
+    mode = 1; /* empty: click-through everywhere */
+  else
+    {
+      mode = 2;
+      cairo_region_get_extents (shape_region, &ext);
+    }
+
+  broadway_display = GDK_BROADWAY_DISPLAY (gdk_surface_get_display (surface));
+  _gdk_broadway_server_surface_set_input_region (broadway_display->server,
+                                                 impl->id, mode,
+                                                 ext.x, ext.y, ext.width, ext.height);
 }
 
 static void
@@ -867,6 +1039,7 @@ struct _MoveResizeData
   gboolean is_resize;
   GdkSurfaceEdge resize_edge;
   int moveresize_button;
+  gboolean moveresize_first; /* anchor moveresize_x/y from the first event's root */
   int moveresize_x;
   int moveresize_y;
   int moveresize_orig_x;
@@ -907,6 +1080,20 @@ update_pos (MoveResizeData *mv_resize,
             int             new_root_y)
 {
   int dx, dy;
+
+  /* #61: anchor the drag to the first event's root position rather than the
+   * value reconstructed in begin_resize (in + surface->x). The reconstruction
+   * breaks whenever the press coords arrive in a different frame than the
+   * resize target (e.g. a click framed in the main window), yielding
+   * dx == -surface->x and snapping the window to (0,0). Anchoring off the live
+   * event stream keeps the delta in one consistent frame, so the first delta
+   * is 0 by construction. */
+  if (mv_resize->moveresize_first)
+    {
+      mv_resize->moveresize_x = new_root_x;
+      mv_resize->moveresize_y = new_root_y;
+      mv_resize->moveresize_first = FALSE;
+    }
 
   dx = new_root_x - mv_resize->moveresize_x;
   dy = new_root_y - mv_resize->moveresize_y;
@@ -1114,7 +1301,7 @@ _gdk_broadway_moveresize_configure_done (GdkDisplay *display,
   return TRUE;
 }
 
-static GdkSurface *
+GdkSurface *
 gdk_broadway_drag_surface_new (GdkDisplay *display)
 {
   return g_object_new (GDK_TYPE_BROADWAY_DRAG_SURFACE,
@@ -1191,6 +1378,7 @@ gdk_broadway_toplevel_begin_resize (GdkToplevel    *toplevel,
   mv_resize->is_resize = TRUE;
   mv_resize->moveresize_button = button;
   mv_resize->resize_edge = edge;
+  mv_resize->moveresize_first = TRUE;
   mv_resize->moveresize_x = x + surface->x;
   mv_resize->moveresize_y = y + surface->y;
   mv_resize->moveresize_surface = g_object_ref (surface);
@@ -1231,6 +1419,7 @@ gdk_broadway_toplevel_begin_move (GdkToplevel *toplevel,
 
   mv_resize->is_resize = FALSE;
   mv_resize->moveresize_button = button;
+  mv_resize->moveresize_first = TRUE;
   mv_resize->moveresize_x = x + surface->x;
   mv_resize->moveresize_y = y + surface->y;
   mv_resize->moveresize_surface = g_object_ref (surface);
@@ -1524,6 +1713,8 @@ gdk_broadway_toplevel_set_property (GObject      *object,
       break;
 
     case LAST_PROP + GDK_TOPLEVEL_PROP_ICON_LIST:
+      gdk_broadway_surface_set_icon_list (surface, g_value_get_pointer (value));
+      g_object_notify_by_pspec (G_OBJECT (surface), pspec);
       break;
 
     case LAST_PROP + GDK_TOPLEVEL_PROP_DECORATED:
@@ -1559,7 +1750,7 @@ gdk_broadway_toplevel_get_property (GObject    *object,
       break;
 
     case LAST_PROP + GDK_TOPLEVEL_PROP_TITLE:
-      g_value_set_static_string (value, "");
+      g_value_set_string (value, GDK_BROADWAY_SURFACE (surface)->title);
       break;
 
     case LAST_PROP + GDK_TOPLEVEL_PROP_STARTUP_ID:
@@ -1589,9 +1780,11 @@ gdk_broadway_toplevel_get_property (GObject    *object,
       break;
 
     case LAST_PROP + GDK_TOPLEVEL_PROP_CAPABILITIES:
+      /* Broadway can't iconify - don't advertise MINIMIZE so the minimize
+       * action is disabled (the button is dropped from the layout too).
+       * The minimize code path stays for a future WM. */
       g_value_set_flags (value, GDK_TOPLEVEL_CAPABILITIES_MAXIMIZE |
-                                GDK_TOPLEVEL_CAPABILITIES_FULLSCREEN |
-                                GDK_TOPLEVEL_CAPABILITIES_MINIMIZE);
+                                GDK_TOPLEVEL_CAPABILITIES_FULLSCREEN);
       break;
 
     case LAST_PROP + GDK_TOPLEVEL_PROP_GRAVITY:
@@ -1635,6 +1828,22 @@ show_surface (GdkSurface *surface)
     gdk_surface_invalidate_rect (surface, NULL);
 }
 
+/* BROTWAY_MAXIMIZE opt-in: auto-maximize the app's main (first) toplevel. Read
+ * once; off by default. */
+static gboolean
+broadway_auto_maximize_main (void)
+{
+  static int enabled = -1;
+
+  if (enabled < 0)
+    enabled = broadway_env_flag ("BROTWAY_MAXIMIZE", FALSE);
+
+  return enabled;
+}
+
+/* One main window per client: only the first toplevel is auto-maximized. */
+static gboolean auto_maximize_done = FALSE;
+
 static void
 gdk_broadway_toplevel_present (GdkToplevel       *toplevel,
                                GdkToplevelLayout *layout)
@@ -1642,12 +1851,14 @@ gdk_broadway_toplevel_present (GdkToplevel       *toplevel,
   GdkSurface *surface = GDK_SURFACE (toplevel);
   int width, height;
   gboolean maximize;
+  gboolean app_set_maximized;
 
   gdk_broadway_surface_unminimize (surface);
 
   compute_toplevel_size (surface, gdk_toplevel_layout_get_resizable (layout), &width, &height);
 
-  if (gdk_toplevel_layout_get_maximized (layout, &maximize))
+  app_set_maximized = gdk_toplevel_layout_get_maximized (layout, &maximize);
+  if (app_set_maximized)
     {
       if (maximize)
         gdk_broadway_surface_maximize (surface);
@@ -1655,7 +1866,43 @@ gdk_broadway_toplevel_present (GdkToplevel       *toplevel,
         gdk_broadway_surface_unmaximize (surface);
     }
 
+  /* Opt-in (BROTWAY_MAXIMIZE): maximize the app's first toplevel when it didn't
+   * ask for a state itself. A Broadway client is one browser viewport, so having
+   * the main window fill it is the natural default. Dialogs (later toplevels)
+   * still float. (#52) */
+  if (broadway_auto_maximize_main () && !app_set_maximized && !auto_maximize_done &&
+      !GDK_SURFACE_IS_MAPPED (surface))
+    {
+      auto_maximize_done = TRUE;
+      gdk_broadway_surface_maximize (surface);
+    }
+
   gdk_surface_request_layout (surface);
+
+  /* Center a new toplevel on the monitor rather than letting it land at the
+   * top-left (0,0) default. Only on first map (re-present keeps the user's
+   * position), not when maximized (the main window fills the screen), and only
+   * when the monitor bounds are known. 4.22.2 moved size/shadow computation into
+   * compute_toplevel_size(), so fetch the monitor locally here. */
+  {
+    GdkBroadwaySurface *impl = GDK_BROADWAY_SURFACE (surface);
+    GdkDisplay *display = gdk_surface_get_display (surface);
+    GdkMonitor *monitor = gdk_display_get_monitor_at_surface (display, surface);
+
+    if (monitor &&
+        !impl->maximized &&
+        !GDK_SURFACE_IS_MAPPED (surface))
+      {
+        GdkRectangle monitor_geometry;
+        int x, y;
+
+        gdk_monitor_get_geometry (monitor, &monitor_geometry);
+        x = (monitor_geometry.width - width) / 2;
+        y = (monitor_geometry.height - height) / 2;
+
+        gdk_broadway_surface_move (surface, MAX (0, x), MAX (0, y));
+      }
+  }
   show_surface (surface);
 }
 

@@ -2,6 +2,11 @@
 
 #include <glib.h>
 
+/* Upper bound on clipboard text transferred to/from the browser. Caps the
+ * allocation a (possibly malicious or buggy) browser-supplied length can drive
+ * on the daemon, and the resulting reply size on the client. */
+#define BROADWAY_CLIPBOARD_MAX_SIZE (16 * 1024 * 1024)
+
 typedef struct  {
     gint32 x, y;
     gint32 width, height;
@@ -65,7 +70,22 @@ typedef enum {
   BROADWAY_EVENT_SCREEN_SIZE_CHANGED = 12,
   BROADWAY_EVENT_FOCUS = 13,
   BROADWAY_EVENT_ROUNDTRIP_NOTIFY = 14,
+  BROADWAY_EVENT_CLIPBOARD_CONTENTS = 15,
+  BROADWAY_EVENT_PING = 16,
+  BROADWAY_EVENT_MENU = 17, /* daemon-intercepted: summon the debug menu */
+  BROADWAY_EVENT_SUSPEND = 18, /* tab hidden: freeze app rendering (no payload) */
+  BROADWAY_EVENT_RESUME = 19,  /* tab visible again: thaw rendering (no payload) */
+  BROADWAY_EVENT_SET_PNG = 20, /* daemon->client: switch the PNG preset (from the debug menu) */
+  BROADWAY_EVENT_COLOR_SCHEME = 21, /* daemon-intercepted: browser prefers-color-scheme (0 no-pref, 1 dark, 2 light) */
+  BROADWAY_EVENT_REDUCED_MOTION = 22, /* daemon-intercepted: browser prefers-reduced-motion (0 no-pref, 1 reduce) */
 } BroadwayEventType;
+
+/* PNG preset (BROADWAY_EVENT_SET_PNG / "png-preset"). The client maps it to
+ * libpng/zlib knobs - the daemon doesn't link png. FAST: LAN; COMPACT: remote. */
+typedef enum {
+  BROADWAY_PNG_FAST = 0,
+  BROADWAY_PNG_COMPACT = 1,
+} BroadwayPngPreset;
 
 typedef enum {
   BROADWAY_OP_GRAB_POINTER = 0,
@@ -85,6 +105,19 @@ typedef enum {
   BROADWAY_OP_RELEASE_TEXTURE = 14,
   BROADWAY_OP_SET_NODES = 15,
   BROADWAY_OP_ROUNDTRIP = 16,
+  BROADWAY_OP_SET_CLIPBOARD = 17,
+  BROADWAY_OP_REQUEST_CLIPBOARD = 18,
+  BROADWAY_OP_SET_INPUT_REGION = 19,
+  BROADWAY_OP_REASSERT_POINTER = 20,
+  BROADWAY_OP_OPEN_URI = 21,
+  BROADWAY_OP_SESSION = 22,
+  BROADWAY_OP_PONG = 23,
+  BROADWAY_OP_DEBUG_FLASH = 24,  /* daemon->client: toggle the paint-flash overlay */
+  BROADWAY_OP_DEBUG_SET_SCREEN = 25, /* daemon->client: pin logical screen w,h,scale (0,0,0 = unpin) */
+  BROADWAY_OP_SET_CURSOR = 26,   /* daemon->client: set a surface's CSS cursor by name */
+  BROADWAY_OP_SET_TITLE = 27,    /* daemon->client: set a surface's window title */
+  BROADWAY_OP_SET_ICON = 28,     /* daemon->client: set a surface's icon (PNG bytes, len 0 = unset) */
+  BROADWAY_OP_SET_MODAL = 29,    /* daemon->client: mark a surface modal (1) or not (0) */
 } BroadwayOpType;
 
 typedef struct {
@@ -114,9 +147,16 @@ typedef struct {
   guint32 button;
 } BroadwayInputButtonMsg;
 
+/* Scroll deltas cross the wire as fixed-point ints (delta * scale); keep in
+ * sync with broadway.js. */
+#define BROADWAY_SCROLL_FIXED_SCALE 1000
+
 typedef struct {
   BroadwayInputPointerMsg pointer;
-  gint32 dir;
+  gint32 dx;       /* delta_x * BROADWAY_SCROLL_FIXED_SCALE */
+  gint32 dy;       /* delta_y * BROADWAY_SCROLL_FIXED_SCALE */
+  guint32 unit;    /* GdkScrollUnit: 0 = wheel clicks, 1 = surface pixels */
+  guint32 is_stop; /* 1 = scroll-stop marker (kinetic trigger); dx/dy are 0 */
 } BroadwayInputScrollMsg;
 
 typedef struct {
@@ -178,6 +218,11 @@ typedef struct {
   gint32 old_id;
 } BroadwayInputFocusMsg;
 
+typedef struct {
+  BroadwayInputBaseMsg base;
+  gint32 preset;  /* BroadwayPngPreset */
+} BroadwayInputSetPngMsg;
+
 typedef union {
   BroadwayInputBaseMsg base;
   BroadwayInputPointerMsg pointer;
@@ -192,6 +237,7 @@ typedef union {
   BroadwayInputDeleteNotify delete_notify;
   BroadwayInputScreenResizeNotify screen_resize_notify;
   BroadwayInputFocusMsg focus;
+  BroadwayInputSetPngMsg set_png;
 } BroadwayInputMsg;
 
 typedef enum {
@@ -213,6 +259,14 @@ typedef enum {
   BROADWAY_REQUEST_SET_NODES,
   BROADWAY_REQUEST_ROUNDTRIP,
   BROADWAY_REQUEST_SET_MODAL_HINT,
+  BROADWAY_REQUEST_SET_CLIPBOARD,
+  BROADWAY_REQUEST_REQUEST_CLIPBOARD,
+  BROADWAY_REQUEST_SET_INPUT_REGION,
+  BROADWAY_REQUEST_OPEN_URI,
+  BROADWAY_REQUEST_SET_CURSOR,
+  BROADWAY_REQUEST_SET_TITLE,
+  BROADWAY_REQUEST_SET_ICON,
+  BROADWAY_REQUEST_SET_KEEP_ABOVE,
 } BroadwayRequestType;
 
 typedef struct {
@@ -275,6 +329,7 @@ typedef struct {
   gint32 y;
   guint32 width;
   guint32 height;
+  guint32 is_popup; /* TRUE for menus/popovers, FALSE for toplevels (incl. dialogs) */
 } BroadwayRequestNewSurface;
 
 typedef struct {
@@ -298,6 +353,52 @@ typedef struct {
   gboolean modal_hint;
 } BroadwayRequestSetModalHint;
 
+typedef struct {
+  BroadwayRequestBase base;
+  guint32 id;
+  gboolean keep_above;
+} BroadwayRequestSetKeepAbove;
+
+typedef struct {
+  BroadwayRequestBase base;
+  guint32 id;
+  guint32 mode;       /* 0 = whole surface, 1 = empty (click-through), 2 = rect */
+  BroadwayRect rect;  /* interactive area (mode 2); the input region's bounding box */
+} BroadwayRequestSetInputRegion;
+
+typedef struct {
+  BroadwayRequestBase base;
+  guint32 len;
+  char text[1];
+} BroadwayRequestSetClipboard;
+
+typedef struct {
+  BroadwayRequestBase base;
+  guint32 len;
+  char uri[1];
+} BroadwayRequestOpenUri;
+
+typedef struct {
+  BroadwayRequestBase base;
+  guint32 id;
+  guint32 len;
+  char name[1];
+} BroadwayRequestSetCursor;
+
+typedef struct {
+  BroadwayRequestBase base;
+  guint32 id;
+  guint32 len;
+  char title[1];
+} BroadwayRequestSetTitle;
+
+typedef struct {
+  BroadwayRequestBase base;
+  guint32 id;
+  guint32 len;
+  char data[1];  /* PNG bytes */
+} BroadwayRequestSetIcon;
+
 typedef union {
   BroadwayRequestBase base;
   BroadwayRequestNewSurface new_surface;
@@ -318,6 +419,13 @@ typedef union {
   BroadwayRequestReleaseTexture release_texture;
   BroadwayRequestSetNodes set_nodes;
   BroadwayRequestSetModalHint set_modal_hint;
+  BroadwayRequestSetInputRegion set_input_region;
+  BroadwayRequestSetClipboard set_clipboard;
+  BroadwayRequestOpenUri open_uri;
+  BroadwayRequestSetCursor set_cursor;
+  BroadwayRequestSetTitle set_title;
+  BroadwayRequestSetIcon set_icon;
+  BroadwayRequestSetKeepAbove set_keep_above;
 } BroadwayRequest;
 
 typedef enum {
@@ -326,7 +434,8 @@ typedef enum {
   BROADWAY_REPLY_QUERY_MOUSE,
   BROADWAY_REPLY_NEW_SURFACE,
   BROADWAY_REPLY_GRAB_POINTER,
-  BROADWAY_REPLY_UNGRAB_POINTER
+  BROADWAY_REPLY_UNGRAB_POINTER,
+  BROADWAY_REPLY_CLIPBOARD
 } BroadwayReplyType;
 
 typedef struct {
@@ -358,6 +467,12 @@ typedef struct {
   BroadwayInputMsg msg;
 } BroadwayReplyEvent;
 
+typedef struct {
+  BroadwayReplyBase base;
+  guint32 len;
+  char text[1];
+} BroadwayReplyClipboard;
+
 typedef union {
   BroadwayReplyBase base;
   BroadwayReplySync sync;
@@ -366,5 +481,6 @@ typedef union {
   BroadwayReplyNewSurface new_surface;
   BroadwayReplyGrabPointer grab_pointer;
   BroadwayReplyUngrabPointer ungrab_pointer;
+  BroadwayReplyClipboard clipboard;
 } BroadwayReply;
 

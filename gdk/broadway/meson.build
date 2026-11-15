@@ -1,8 +1,11 @@
 gdk_broadway_sources = files([
   'broadway-output.c',
+  'broadway-env.c',
+  'broadway-portal.c',
   'broadway-server.c',
   'broadwayd.c',
   'gdkbroadway-server.c',
+  'gdkclipboard-broadway.c',
   'gdkcairocontext-broadway.c',
   'gdkdrawcontext-broadway.c',
   'gdkcursor-broadway.c',
@@ -13,8 +16,10 @@ gdk_broadway_sources = files([
   'gdkglobals-broadway.c',
   'gdkkeys-broadway.c',
   'gdkmonitor-broadway.c',
+  'gdksettings-broadway.c',
   'gdkseat-broadway.c',
   'gdksurface-broadway.c',
+  'backend-stubs.c',
 ])
 
 gdk_broadway_public_headers = [
@@ -75,6 +80,8 @@ executable('gtk4-broadwayd',
     'broadwayd.c',
     'broadway-server.c',
     'broadway-output.c',
+    'broadway-env.c',
+    'broadway-portal.c',
   ],
   include_directories: [confinc, gdkinc, include_directories('.')],
   c_args: ['-DGTK_COMPILATION', '-DG_LOG_DOMAIN="Gdk"', ],

@@ -12,6 +12,10 @@
 #include "gdkprivate.h"
 
 #include <gdk/gdktextureprivate.h>
+#include "loaders/gdkpngprivate.h"
+
+#include <png.h>
+#include <zlib.h>   /* Z_RLE / Z_FILTERED / ... for png_set_compression_strategy */
 
 #include <glib.h>
 #include <glib/gprintf.h>
@@ -43,11 +47,14 @@ struct _GdkBroadwayServer {
   GSocketConnection *connection;
 
   guint32 recv_buffer_size;
-  guint8 recv_buffer[1024];
+  guint32 recv_buffer_capacity;
+  guint8 *recv_buffer;
 
   guint process_input_idle;
   GList *incoming;
 };
+
+#define RECV_BUFFER_INITIAL_SIZE 1024
 
 struct _GdkBroadwayServerClass
 {
@@ -65,11 +72,17 @@ gdk_broadway_server_init (GdkBroadwayServer *server)
 {
   server->next_serial = 1;
   server->next_texture_id = 1;
+  server->recv_buffer_capacity = RECV_BUFFER_INITIAL_SIZE;
+  server->recv_buffer = g_malloc (server->recv_buffer_capacity);
 }
 
 static void
 gdk_broadway_server_finalize (GObject *object)
 {
+  GdkBroadwayServer *server = GDK_BROADWAY_SERVER (object);
+
+  g_free (server->recv_buffer);
+
   G_OBJECT_CLASS (gdk_broadway_server_parent_class)->finalize (object);
 }
 
@@ -227,11 +240,34 @@ gdk_broadway_server_send_message_with_size (GdkBroadwayServer *server, BroadwayR
 #define gdk_broadway_server_send_fd_message(_server, _msg, _type, _fd)      \
   gdk_broadway_server_send_message_with_size(_server, (BroadwayRequestBase *)&_msg, sizeof (_msg), _type, _fd)
 
+/* Grow the receive buffer so it can hold at least @needed bytes. Clipboard
+ * replies are variable-sized and can exceed the initial buffer; without this a
+ * reply larger than the buffer could never be assembled. */
+static void
+ensure_recv_capacity (GdkBroadwayServer *server, guint32 needed)
+{
+  guint32 capacity = server->recv_buffer_capacity;
+
+  if (needed <= capacity)
+    return;
+
+  /* Double, but stop before guint32 overflows (which would wrap to 0 and spin
+   * forever / under-allocate); fall back to the exact size for the last step. */
+  while (capacity < needed && capacity <= G_MAXUINT32 / 2)
+    capacity *= 2;
+  if (capacity < needed)
+    capacity = needed;
+
+  server->recv_buffer = g_realloc (server->recv_buffer, capacity);
+  server->recv_buffer_capacity = capacity;
+}
+
 static void
 parse_all_input (GdkBroadwayServer *server)
 {
   guint8 *p, *end;
   guint32 size;
+  guint32 incomplete_size = 0;
   BroadwayReply *reply;
 
   p = server->recv_buffer;
@@ -241,7 +277,12 @@ parse_all_input (GdkBroadwayServer *server)
     {
       memcpy (&size, p, sizeof (guint32));
       if (p + size > end)
-        break;
+        {
+          /* Incomplete message; remember its full size so we can grow the
+           * buffer below to make room for the rest of it. */
+          incomplete_size = size;
+          break;
+        }
 
       reply = g_memdup2 (p, size);
       p += size;
@@ -249,9 +290,24 @@ parse_all_input (GdkBroadwayServer *server)
       server->incoming = g_list_append (server->incoming, reply);
     }
 
-  if (p < end)
+  if (p < end && p != server->recv_buffer)
     memmove (server->recv_buffer, p, end - p);
   server->recv_buffer_size = end - p;
+
+  /* Done with p/end (into the old buffer) before any realloc that may move it. */
+  if (incomplete_size > 0)
+    {
+      /* The largest legitimate frame is a clipboard reply (text capped at
+       * BROADWAY_CLIPBOARD_MAX_SIZE) plus a small header. A larger claimed size
+       * means a corrupt/hostile stream; bail rather than try to allocate it. */
+      if (incomplete_size > BROADWAY_CLIPBOARD_MAX_SIZE + 1024)
+        {
+          g_printerr ("Broadway server sent an oversized message (%u bytes)\n",
+                      incomplete_size);
+          exit (1);
+        }
+      ensure_recv_capacity (server, incomplete_size);
+    }
 }
 
 static void
@@ -262,9 +318,10 @@ read_some_input_blocking (GdkBroadwayServer *server)
 
   in = g_io_stream_get_input_stream (G_IO_STREAM (server->connection));
 
-  g_assert (server->recv_buffer_size < sizeof (server->recv_buffer));
+  if (server->recv_buffer_size == server->recv_buffer_capacity)
+    ensure_recv_capacity (server, server->recv_buffer_capacity + 1);
   res = g_input_stream_read (in, &server->recv_buffer[server->recv_buffer_size],
-                             sizeof (server->recv_buffer) - server->recv_buffer_size,
+                             server->recv_buffer_capacity - server->recv_buffer_size,
                              NULL, NULL);
 
   if (res <= 0)
@@ -287,10 +344,11 @@ read_some_input_nonblocking (GdkBroadwayServer *server)
   in = g_io_stream_get_input_stream (G_IO_STREAM (server->connection));
   pollable = G_POLLABLE_INPUT_STREAM (in);
 
-  g_assert (server->recv_buffer_size < sizeof (server->recv_buffer));
+  if (server->recv_buffer_size == server->recv_buffer_capacity)
+    ensure_recv_capacity (server, server->recv_buffer_capacity + 1);
   error = NULL;
   res = g_pollable_input_stream_read_nonblocking (pollable, &server->recv_buffer[server->recv_buffer_size],
-                                                  sizeof (server->recv_buffer) - server->recv_buffer_size,
+                                                  server->recv_buffer_capacity - server->recv_buffer_size,
                                                   NULL, &error);
 
   if (res < 0 && g_error_matches (error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
@@ -339,6 +397,21 @@ process_input_messages (GdkBroadwayServer *server)
 
       if (reply->base.type == BROADWAY_REPLY_EVENT)
         _gdk_broadway_events_got_input (server->display, &reply->event.msg);
+      else if (reply->base.type == BROADWAY_REPLY_CLIPBOARD &&
+               reply->base.size >= G_STRUCT_OFFSET (BroadwayReplyClipboard, text))
+        {
+          /* Don't trust the wire len: clamp to what the framed reply carries
+           * so the text read never runs past the allocation. A size below the
+           * fixed header would wrap the clamp. */
+          gsize max = reply->base.size -
+                      G_STRUCT_OFFSET (BroadwayReplyClipboard, text);
+          guint32 len = reply->clipboard.len > max
+                        ? (guint32) max : reply->clipboard.len;
+          _gdk_broadway_clipboard_contents_received (server->display,
+                                                     reply->base.in_reply_to,
+                                                     reply->clipboard.text,
+                                                     len);
+        }
       else
         g_warning ("Unhandled reply type %d", reply->base.type);
       g_free (reply);
@@ -470,7 +543,8 @@ _gdk_broadway_server_new_surface (GdkBroadwayServer *server,
                                  int x,
                                  int y,
                                  int width,
-                                 int height)
+                                 int height,
+                                 gboolean is_popup)
 {
   BroadwayRequestNewSurface msg;
   guint32 serial, id;
@@ -480,6 +554,7 @@ _gdk_broadway_server_new_surface (GdkBroadwayServer *server,
   msg.y = y;
   msg.width = width;
   msg.height = height;
+  msg.is_popup = is_popup;
   serial = gdk_broadway_server_send_message (server, msg,
                                              BROADWAY_REQUEST_NEW_SURFACE);
   reply = gdk_broadway_server_wait_for_reply (server, serial);
@@ -565,6 +640,35 @@ _gdk_broadway_server_surface_set_modal_hint (GdkBroadwayServer *server,
 				    BROADWAY_REQUEST_SET_MODAL_HINT);
 }
 
+void
+_gdk_broadway_server_surface_set_keep_above (GdkBroadwayServer *server,
+                                             int id, gboolean keep_above)
+{
+  BroadwayRequestSetKeepAbove msg;
+
+  msg.id = id;
+  msg.keep_above = keep_above;
+  gdk_broadway_server_send_message (server, msg,
+				    BROADWAY_REQUEST_SET_KEEP_ABOVE);
+}
+
+void
+_gdk_broadway_server_surface_set_input_region (GdkBroadwayServer *server,
+                                               int id, int mode,
+                                               int x, int y, int width, int height)
+{
+  BroadwayRequestSetInputRegion msg;
+
+  msg.id = id;
+  msg.mode = mode;
+  msg.rect.x = x;
+  msg.rect.y = y;
+  msg.rect.width = width;
+  msg.rect.height = height;
+  gdk_broadway_server_send_message (server, msg,
+				    BROADWAY_REQUEST_SET_INPUT_REGION);
+}
+
 static int
 open_shared_memory (void)
 {
@@ -613,6 +717,62 @@ open_shared_memory (void)
   return ret;
 }
 
+/* Per-frame PNG re-encode trades encode CPU (latency) against frame size - one
+ * axis, two presets:
+ *   FAST    - low zlib level, adaptive filter: localhost/LAN (default).
+ *   COMPACT - higher level, adaptive filter: remote/metered.
+ * Seeded from BROADWAY_PNG, switchable live from the debug menu.
+ *
+ * Both keep adaptive filtering: SUB+RLE bloats AA text/gradients ~50%+ (measured
+ * on real treeview textures), shifting cost to client transfer+decode and hurting
+ * scroll smoothness. Adaptive filter is what keeps these small; the level is the
+ * cheap CPU knob, so FAST drops only the level. */
+typedef struct {
+  int level;     /* zlib level 0-9 */
+  int filter;    /* libpng filter mask */
+  int strategy;  /* zlib strategy */
+} BroadwayPngPresetDef;
+
+static const BroadwayPngPresetDef png_presets[] = {
+  [BROADWAY_PNG_FAST]    = { 3, PNG_ALL_FILTERS, Z_DEFAULT_STRATEGY },
+  [BROADWAY_PNG_COMPACT] = { 7, PNG_ALL_FILTERS, Z_DEFAULT_STRATEGY },
+};
+
+static int png_preset = BROADWAY_PNG_FAST;
+static gsize png_preset_init = 0;
+
+static int
+broadway_png_preset (void)
+{
+  if (g_once_init_enter (&png_preset_init))
+    {
+      const char *v = g_getenv ("BROTWAY_PNG");
+
+      if (v && *v)
+        {
+          if (g_ascii_strcasecmp (v, "fast") == 0)         png_preset = BROADWAY_PNG_FAST;
+          else if (g_ascii_strcasecmp (v, "compact") == 0) png_preset = BROADWAY_PNG_COMPACT;
+          else g_warning ("BROADWAY_PNG: unknown '%s' (fast|compact)", v);
+        }
+      g_once_init_leave (&png_preset_init, 1);
+    }
+  return png_preset;
+}
+
+/* Debug-menu switch; out-of-range ids ignored. */
+void
+_gdk_broadway_server_set_png_preset (int preset)
+{
+  (void) broadway_png_preset (); /* run env seed first */
+
+  if (preset >= 0 && preset < (int) G_N_ELEMENTS (png_presets))
+    {
+      png_preset = preset;
+      g_message ("broadway: PNG preset -> %s",
+                 preset == BROADWAY_PNG_COMPACT ? "compact" : "fast");
+    }
+}
+
 guint32
 gdk_broadway_server_upload_texture (GdkBroadwayServer *server,
                                     GdkTexture        *texture)
@@ -623,8 +783,10 @@ gdk_broadway_server_upload_texture (GdkBroadwayServer *server,
   const guchar *data;
   gsize size;
   int fd;
+  const BroadwayPngPresetDef *png_cfg = &png_presets[broadway_png_preset ()];
 
-  bytes = gdk_texture_save_to_png_bytes (texture);
+  bytes = gdk_save_png_full (texture, NULL,
+                             png_cfg->level, png_cfg->filter, png_cfg->strategy);
   fd = open_shared_memory ();
   data = g_bytes_get_data (bytes, &size);
 
@@ -769,4 +931,153 @@ _gdk_broadway_server_set_show_keyboard (GdkBroadwayServer *server,
   msg.show_keyboard = show;
   gdk_broadway_server_send_message (server, msg,
                                     BROADWAY_REQUEST_SET_SHOW_KEYBOARD);
+}
+
+void
+_gdk_broadway_server_set_clipboard_text (GdkBroadwayServer *server,
+                                         const char        *text)
+{
+  gsize len = text ? strlen (text) : 0;
+  gsize size;
+  BroadwayRequestSetClipboard *msg;
+
+  if (len > BROADWAY_CLIPBOARD_MAX_SIZE)
+    len = BROADWAY_CLIPBOARD_MAX_SIZE;
+
+  size = G_STRUCT_OFFSET (BroadwayRequestSetClipboard, text) + len;
+  /* Pad to 4 bytes (zero-filled) so the daemon's framing loop keeps the
+   * following requests in the stream aligned. */
+  size = (size + 3) & ~(gsize) 3;
+  /* Allocate at least the full struct so accessing msg->len stays in bounds
+   * (the text[1] member makes sizeof larger than size when len is small). */
+  msg = g_malloc0 (MAX (size, sizeof *msg));
+
+  msg->len = (guint32) len;
+  if (len > 0)
+    memcpy (msg->text, text, len);
+
+  gdk_broadway_server_send_message_with_size (server, (BroadwayRequestBase *) msg,
+                                              size, BROADWAY_REQUEST_SET_CLIPBOARD, -1);
+  g_free (msg);
+}
+
+guint32
+_gdk_broadway_server_request_clipboard (GdkBroadwayServer *server)
+{
+  BroadwayRequestBase msg;
+  return gdk_broadway_server_send_message_with_size (server, &msg, sizeof (msg),
+                                                     BROADWAY_REQUEST_REQUEST_CLIPBOARD, -1);
+}
+
+void
+_gdk_broadway_server_open_uri (GdkBroadwayServer *server,
+                               const char        *uri)
+{
+  gsize len = uri ? strlen (uri) : 0;
+  gsize size;
+  BroadwayRequestOpenUri *msg;
+
+  if (len == 0)
+    return;
+
+  if (len > BROADWAY_CLIPBOARD_MAX_SIZE)
+    len = BROADWAY_CLIPBOARD_MAX_SIZE;
+
+  size = G_STRUCT_OFFSET (BroadwayRequestOpenUri, uri) + len;
+  /* Pad to 4 bytes (zero-filled) to keep the daemon's request stream aligned. */
+  size = (size + 3) & ~(gsize) 3;
+  /* Allocate at least the full struct so accessing msg->len stays in bounds
+   * (the uri[1] member makes sizeof larger than size when len is small). */
+  msg = g_malloc0 (MAX (size, sizeof *msg));
+
+  msg->len = (guint32) len;
+  memcpy (msg->uri, uri, len);
+
+  gdk_broadway_server_send_message_with_size (server, (BroadwayRequestBase *) msg,
+                                              size, BROADWAY_REQUEST_OPEN_URI, -1);
+  g_free (msg);
+}
+
+void
+_gdk_broadway_server_surface_set_cursor (GdkBroadwayServer *server,
+                                         int                id,
+                                         const char        *name)
+{
+  gsize len = name ? strlen (name) : 0;
+  gsize size;
+  BroadwayRequestSetCursor *msg;
+
+  size = G_STRUCT_OFFSET (BroadwayRequestSetCursor, name) + len;
+  /* Pad to 4 bytes (zero-filled) to keep the daemon's request stream aligned. */
+  size = (size + 3) & ~(gsize) 3;
+  /* Allocate at least the full struct so accessing msg->len stays in bounds
+   * (the name[1] member makes sizeof larger than size when len is small). */
+  msg = g_malloc0 (MAX (size, sizeof *msg));
+
+  msg->id = id;
+  msg->len = (guint32) len;
+  if (len > 0)
+    memcpy (msg->name, name, len);
+
+  gdk_broadway_server_send_message_with_size (server, (BroadwayRequestBase *) msg,
+                                              size, BROADWAY_REQUEST_SET_CURSOR, -1);
+  g_free (msg);
+}
+
+void
+_gdk_broadway_server_surface_set_title (GdkBroadwayServer *server,
+                                        int                id,
+                                        const char        *title)
+{
+  gsize len = title ? strlen (title) : 0;
+  gsize size;
+  BroadwayRequestSetTitle *msg;
+
+  if (len > BROADWAY_CLIPBOARD_MAX_SIZE)
+    len = BROADWAY_CLIPBOARD_MAX_SIZE;
+
+  size = G_STRUCT_OFFSET (BroadwayRequestSetTitle, title) + len;
+  /* Pad to 4 bytes (zero-filled) to keep the daemon's request stream aligned. */
+  size = (size + 3) & ~(gsize) 3;
+  /* Allocate at least the full struct so accessing msg->len stays in bounds
+   * (the title[1] member makes sizeof larger than size when len is small). */
+  msg = g_malloc0 (MAX (size, sizeof *msg));
+
+  msg->id = id;
+  msg->len = (guint32) len;
+  if (len > 0)
+    memcpy (msg->title, title, len);
+
+  gdk_broadway_server_send_message_with_size (server, (BroadwayRequestBase *) msg,
+                                              size, BROADWAY_REQUEST_SET_TITLE, -1);
+  g_free (msg);
+}
+
+void
+_gdk_broadway_server_surface_set_icon (GdkBroadwayServer *server,
+                                       int                id,
+                                       const guchar      *data,
+                                       gsize              len)
+{
+  gsize size;
+  BroadwayRequestSetIcon *msg;
+
+  if (len > BROADWAY_CLIPBOARD_MAX_SIZE)
+    len = BROADWAY_CLIPBOARD_MAX_SIZE;
+
+  size = G_STRUCT_OFFSET (BroadwayRequestSetIcon, data) + len;
+  /* Pad to 4 bytes (zero-filled) to keep the daemon's request stream aligned. */
+  size = (size + 3) & ~(gsize) 3;
+  /* Allocate at least the full struct so accessing msg->len stays in bounds
+   * (the data[1] member makes sizeof larger than size when len is small). */
+  msg = g_malloc0 (MAX (size, sizeof *msg));
+
+  msg->id = id;
+  msg->len = (guint32) len;
+  if (len > 0)
+    memcpy (msg->data, data, len);
+
+  gdk_broadway_server_send_message_with_size (server, (BroadwayRequestBase *) msg,
+                                              size, BROADWAY_REQUEST_SET_ICON, -1);
+  g_free (msg);
 }
