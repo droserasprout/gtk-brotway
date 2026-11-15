@@ -5,11 +5,11 @@ name: CI
 
 on:
   push:
-    branches: [4.24.1-brotway]
+    branches: [experiment/gtk-4.24.1]
 
 jobs:
   build:
-    uses: droserasprout/gtk-brotway/.github/workflows/build.yml@ci
+    uses: droserasprout/gtk-brotway/.github/workflows/build.yml@experiment/gtk-4.24.1-ci
     with:
       ref: ${{ github.sha }}
       gtk: "4.24.1"
