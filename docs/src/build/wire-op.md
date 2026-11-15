@@ -103,4 +103,4 @@ Add the new op/request/event rows to [Wire protocol](../internals/protocol.md) -
 
 ## Landing it
 
-Develop on a `<topic>` branch off `4.22.4-brotway`. Branch naming, style, and the PR flow are in [Contributing](contributing.md).
+Develop on a `<topic>` branch off `4.24.1-brotway`. Branch naming, style, and the PR flow are in [Contributing](contributing.md).

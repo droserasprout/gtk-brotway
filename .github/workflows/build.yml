@@ -19,11 +19,11 @@ on:
         required: true
         type: string
       gtk:
-        description: "GTK base version, e.g. 4.22.4 (used in the .deb name + caches)."
+        description: "GTK base version, e.g. 4.24.1 (used in the .deb name + caches)."
         required: true
         type: string
       container:
-        description: "Ubuntu image to build in, e.g. ubuntu:26.04."
+        description: "Ubuntu image to build in, e.g. ubuntu:26.10."
         required: true
         type: string
       demos:
@@ -35,7 +35,7 @@ permissions:
   contents: read
 
 env:
-  RUNTIME_PKGS: "libgtk-4-1, libgtk-4-bin"
+  RUNTIME_PKGS: "libgtk-4-1 (>= 4.24.1), libgtk-4-bin (>= 4.24.1), libglib2.0-0t64 (>= 2.89.3), libpango-1.0-0 (>= 1.58.0), libpangocairo-1.0-0 (>= 1.58.0)"
 
 jobs:
   build:
@@ -59,7 +59,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ccache meson ninja-build pkg-config gettext gettext-base python3 git ca-certificates zstd \
+            build-essential ccache meson ninja-build pkg-config sassc gettext gettext-base python3 git ca-certificates zstd \
             libglib2.0-dev libglib2.0-dev-bin libgraphene-1.0-dev libcairo2-dev libpango1.0-dev \
             libgdk-pixbuf-2.0-dev libepoxy-dev libxkbcommon-dev libfribidi-dev libharfbuzz-dev \
             libjpeg-dev libpng-dev libtiff-dev libdrm-dev
@@ -149,6 +149,14 @@ jobs:
           dpkg-deb --root-owner-group --build pkgroot "${DEB_FILE}"
           dpkg-deb --info "${DEB_FILE}"
           echo "DEB_FILE=${DEB_FILE}" >> "${GITHUB_ENV}"
+
+      - name: Install and smoke-test package
+        run: |
+          apt-get install -y --no-install-recommends "./${DEB_FILE}" python3-gi gir1.2-gtk-4.0
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
+          GTK_A11Y=none timeout 30s gtk4-brotway-run --auto \
+            python3 _ci/packaging/debian/smoke.py "${GTK_VERSION}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

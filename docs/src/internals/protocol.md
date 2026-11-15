@@ -69,6 +69,7 @@ What the browser sends back - input and surface notifications. `TOUCH` (5) alrea
 | `BROADWAY_EVENT_RESUME`             | 19 | tab visible again; thaws rendering ([Connection management](../features/connection.md)) |
 | `BROADWAY_EVENT_SET_PNG`            | 20 | daemon -> app, not from the browser: switch the PNG encoding preset live from the debug menu ([PNG encoding](../guide/config.md#png-encoding)) |
 | `BROADWAY_EVENT_COLOR_SCHEME`       | 21 | browser's `prefers-color-scheme` (0 no-preference, 1 dark, 2 light), on connect and on change; the daemon intercepts it to serve the appearance portal, so it never reaches the app ([Display & rendering](../features/display.md)) |
+| `BROADWAY_EVENT_REDUCED_MOTION`     | 22 | browser’s `prefers-reduced-motion` (0 no preference, 1 reduce), on connect and on change; intercepted by the daemon and exposed through the appearance portal |
 
 ## Requests
 

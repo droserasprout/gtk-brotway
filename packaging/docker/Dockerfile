@@ -8,7 +8,7 @@
 # container into the fork; broadwayd lives in the prefix (run via gtk4-brotway-run
 # or full path). Built multi-arch by .github/workflows/image.yml, which drops both
 # per-arch .debs into ./debs first.
-ARG UBUNTU_VERSION=26.04
+ARG UBUNTU_VERSION=26.10
 FROM ubuntu:${UBUNTU_VERSION}
 ARG DEBIAN_FRONTEND=noninteractive
 # Set to 1 (the `-nogl` variant) to drop the stock GTK + GL/Mesa/LLVM chain after

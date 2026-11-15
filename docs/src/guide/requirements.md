@@ -8,14 +8,22 @@ The fork patches the **host** GTK and serves the app over Broadway, so requireme
 | ---- | ----------- |
 | OS | Linux |
 | Distro | Debian (`.deb`), Arch (PKGBUILD), or Docker base image - see [Installation](installation.md) |
-| GTK | 4.22.x series, matching the system GTK |
+| GTK | 4.24.x series, matching the system GTK |
+| GLib | >= 2.89.3 |
+| Pango | >= 1.58 |
+| Meson (source builds) | >= 1.8 |
 | Architecture | amd64, arm64 |
 
-Current fork base:
+Migration target (unreleased):
 
-| GTK    | Ubuntu base    | SONAME                 | Fork branch | Patch |
+| GTK    | Ubuntu base    | Library file           | Fork branch | Patch |
 | ------ | -------------- | ---------------------- | ----------- | ----- |
-| 4.22.4 | `ubuntu:26.04` | `libgtk-4.so.1.2200.4` | [`4.22.4-brotway`](https://github.com/droserasprout/gtk-brotway/tree/4.22.4-brotway) | [diff](https://github.com/droserasprout/gtk-brotway/compare/4.22.4...4.22.4-brotway) |
+| 4.24.1 | `ubuntu:26.10` | `libgtk-4.so.1.2400.1` | [`4.24.1-brotway`](https://github.com/droserasprout/gtk-brotway/tree/4.24.1-brotway) | [diff](https://github.com/droserasprout/gtk-brotway/compare/4.24.1...4.24.1-brotway) |
+
+The ELF SONAME remains `libgtk-4.so.1`; the full filename identifies the build.
+Upgrade the library and `gtk4-broadwayd` together and restart all applications:
+4.24 changes their private grab request layout. The browser GRAB opcode is unchanged.
+Published v3.2.0 packages still use GTK 4.22.4 and Ubuntu 26.04.
 
 ## Client
 

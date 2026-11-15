@@ -26,7 +26,7 @@ The app process (not the daemon) reads these to target the daemon instead of X11
 | `GDK_BACKEND` | `broadway` | use the Broadway GDK backend |
 | `BROTWAY_DISPLAY` | `:N` | connect to the daemon for display `N` |
 | `BROTWAY_PNG` | `fast` / `compact` | PNG encoding preset ([PNG encoding](#png-encoding)) |
-| `BROTWAY_NO_ANIMATIONS` | boolean | `1` force-disables GTK **and libadwaita** animations (`gtk-enable-animations=false`). Broadway pushes every animated frame over the socket, so turning them off cuts frame churn and bandwidth. |
+| `BROTWAY_NO_ANIMATIONS` | boolean | `1` force-disables GTK **and libadwaita** animations (`gtk-enable-animations=false`); the unreleased 4.24.1 port also sets `gtk-interface-reduced-motion=reduce`. Broadway pushes every animated frame over the socket, so turning them off cuts frame churn and bandwidth. |
 | `BROTWAY_MAXIMIZE` | boolean | `1` maximizes the app's first toplevel when it doesn't set a window state itself, so the main window fills the browser viewport. Dialogs still float. |
 | `BROTWAY_COLOR_SCHEME` | `auto` / `light` / `dark` | force the color scheme for this process; `light`/`dark` pin it and ignore the browser, `auto` (default) follows the browser's `prefers-color-scheme` ([Display & rendering](../features/display.md)) |
 

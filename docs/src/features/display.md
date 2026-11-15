@@ -6,6 +6,7 @@ Rendering-correctness and presentation fixes stock Broadway lacks, mostly around
 
 - **No white flash** on load or zoom-out - unpainted areas follow the browser's light/dark theme.
 - **The app follows the browser's light/dark preference** live: `broadwayd` serves the browser's `prefers-color-scheme` over an `org.freedesktop.appearance` portal, which both plain GTK (as `gtk-interface-color-scheme`) and libadwaita apps read. Set `BROTWAY_COLOR_SCHEME=light`/`dark` to pin it per process and ignore the browser (`auto` is the default).
+- **Reduced motion (unreleased GTK 4.24.1 port)** follows the browser’s `prefers-reduced-motion` setting through the same portal, including live changes and reconnects. GTK’s spinner uses its static appearance when motion is reduced. Pinning the color scheme does not pin motion; `BROTWAY_NO_ANIMATIONS=1` forces reduced motion as well as disabling animations.
 - **Popups land on their anchor**, not offset by their shadow margin.
 - **A popover's shadow passes clicks through** instead of swallowing them (via the [input region](../internals/input-region.md)).
 - **Seam-free borders** - uniform widget borders render without the 1px seam or corner sliver stock leaves.
