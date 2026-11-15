@@ -14,13 +14,13 @@ The tree is large, but you only touch a small corner. This page covers that corn
 
 ## Supported base
 
-One GTK base: `4.22.4-brotway` (4.22.4 on Ubuntu 26.04). Table, SONAME, and the patch diff: [Requirements](../guide/requirements.md).
+One GTK base: `4.24.1-brotway` (4.24.1 on Ubuntu 26.10). Table, SONAME, and the patch diff: [Requirements](../guide/requirements.md).
 
 ## Branch naming
 
-Feature and fix work lives on its own topic branch, branched off `4.22.4-brotway` and named for the topic (e.g. `touch-multiple-selection`). The integration branches (don't develop on these):
+Feature and fix work lives on its own topic branch, branched off `4.24.1-brotway` and named for the topic (e.g. `touch-multiple-selection`). The integration branches (don't develop on these):
 
-- `4.22.4-brotway` - the fork tip that topic branches merge into. Releases build from it.
+- `4.24.1-brotway` - the fork tip that topic branches merge into. Releases build from it.
 - `ci` - an orphan branch holding the reusable build/release workflows and this book.
 
 ### Patch families
@@ -40,7 +40,7 @@ Existing topic branches cluster into a few families; when you fix something, see
 Each feature gets its own git worktree, so you can build and test branches in parallel:
 
 ```sh
-git worktree add ../gtk-wt/<topic> -b <topic> 4.22.4-brotway
+git worktree add ../gtk-wt/<topic> -b <topic> 4.24.1-brotway
 ```
 
 ## Building and testing
@@ -63,10 +63,10 @@ Whether a change needs only a `gtk4-broadwayd` restart or a full library rebuild
 
 ## Submitting a change (PR flow)
 
-1. Branch from `4.22.4-brotway` using the `<topic>` naming (ideally in a worktree).
+1. Branch from `4.24.1-brotway` using the `<topic>` naming (ideally in a worktree).
 2. Make the smallest change that does the job; keep commits focused.
 3. Build the Broadway-only target, and `node --check` any `broadway.js` edit.
-4. Open a PR against `4.22.4-brotway`. A fork branch can run a validation build via its `ci.yml` stub before merge.
+4. Open a PR against `4.24.1-brotway`. A fork branch can run a validation build via its `ci.yml` stub before merge.
 
 Label and milestone every merged PR (change-type label + target `vX.Y.Z` milestone) - the release process cross-checks these against the CHANGELOG.
 

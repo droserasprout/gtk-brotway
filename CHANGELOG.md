@@ -3,6 +3,26 @@
 All notable changes to this project will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Follow the browser’s reduced-motion preference, including live changes and reconnects.
+
+### Changed
+
+- Migrate to GTK 4.24.1 and Ubuntu 26.10.
+- Adopt seat-based popup grabs and frame-clock submission timing.
+
+### Fixed
+
+- Release the Broadway seat’s logical keyboard during disposal.
+- Submit shared popup frame timings only once.
+- Restore mouse-click keyboard focus after touch input.
+- Dismiss popup grabs when clicking another application.
+- Preserve the activated DropDown row when closing a filtered popup.
+- Remove the modal backdrop when a reusable dialog is hidden.
+
 ## v3.2.0 - 2026-07-17
 
 [release](https://github.com/droserasprout/gtk-brotway/releases/tag/v3.2.0) | [diff](https://github.com/droserasprout/gtk-brotway/compare/v3.1.3...v3.2.0)

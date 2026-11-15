@@ -1,6 +1,6 @@
 # Backend comparison
 
-Where the fork sits next to stock Broadway and the native Wayland backend, columns ordered stock -> fork -> native. The **Brotway** column is `4.22.4-brotway`; "Broadway" is stock upstream. The two Broadway columns match across most windowing and platform-integration rows - the fork doesn't touch them, and Broadway has no window manager, desktop session, or GPU, so most never apply.
+Where the fork sits next to stock Broadway and the native Wayland backend, columns ordered stock -> fork -> native. The **Brotway** column is `4.24.1-brotway`; "Broadway" is stock upstream. The two Broadway columns match across most windowing and platform-integration rows - the fork doesn't touch them, and Broadway has no window manager, desktop session, or GPU, so most never apply.
 
 Legend: **🟢** full support, **🟡** partial/workaround/caveats, **🔴** not supported, **⚪** not applicable.
 
