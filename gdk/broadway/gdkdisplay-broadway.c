@@ -23,6 +23,7 @@
 #include "config.h"
 
 #include "gdkdisplay-broadway.h"
+#include "broadway-env.h"   /* broadway_migrate_legacy_env () */
 
 #include "gdkcairocontext-broadway.h"
 #include "gdkdisplay.h"
@@ -32,7 +33,9 @@
 #include "gdkdevice-broadway.h"
 #include "gdkdeviceprivate.h"
 #include <gdk/gdktextureprivate.h>
+#include <gdk/gdkcolorstateprivate.h>
 #include "gdkprivate.h"
+#include "gdksurface-broadway.h"
 
 #include <glib.h>
 #include <glib/gprintf.h>
@@ -53,12 +56,205 @@ static void   gdk_broadway_display_finalize           (GObject            *objec
 
 G_DEFINE_TYPE (GdkBroadwayDisplay, gdk_broadway_display, GDK_TYPE_DISPLAY)
 
+/* Content-based texture dedup cache (see gdkdisplay-broadway.h). Tier 2 beneath
+ * the renderer's node-level reuse: catches re-rasterized-but-identical pixels
+ * (text moved by scroll, re-hovered rows, repeated icons) that get a fresh
+ * GdkTexture object and would otherwise re-encode + re-upload the same PNG. */
+#define BROADWAY_CONTENT_CACHE_MAX        4096       /* distinct cached textures */
+#define BROADWAY_CONTENT_CACHE_MAX_PIXELS (512 * 512) /* skip dedup above this area */
+
+typedef struct {
+  guint64 hash;     /* FNV-1a-64 of downloaded raw pixels */
+  guint64 hash2;    /* independent second hash of the same bytes; a single 64-bit
+                     * hash colliding would alias unrelated images for the LRU's
+                     * lifetime, so equality demands both */
+  int     width;
+  int     height;
+  int     format;   /* (int) native GdkMemoryFormat: the wire PNG encodes at the
+                     * texture's native depth, so same downloads != same wire bytes */
+  GdkColorState *color_state; /* native color state, also wire-encoded. Borrowed
+                               * in lookup keys; entries own a ref */
+} ContentKey;
+
+typedef struct {
+  ContentKey key;       /* embedded; the hash-table key points at this */
+  guint32    id;        /* broadway texture id this content was uploaded under */
+  GList     *lru_link;  /* this entry's link in content_texture_lru */
+  guint      refcount;  /* live GdkTextures sharing this id; only refcount==0 is evictable */
+} ContentCacheEntry;
+
+/* color_state is deliberately not hashed: distinct-but-equal GdkColorState
+ * objects must land in the same bucket for content_key_equal to see them. */
+static guint
+content_key_hash (gconstpointer v)
+{
+  const ContentKey *k = v;
+
+  return (guint) (k->hash ^ (k->hash >> 32) ^
+                  k->hash2 ^ (k->hash2 >> 32) ^
+                  ((guint64) k->width << 16) ^ (guint) k->height ^
+                  ((guint64) k->format << 8));
+}
+
+static gboolean
+content_key_equal (gconstpointer a,
+                   gconstpointer b)
+{
+  const ContentKey *ka = a;
+  const ContentKey *kb = b;
+
+  return ka->hash == kb->hash && ka->hash2 == kb->hash2 &&
+         ka->width == kb->width && ka->height == kb->height &&
+         ka->format == kb->format &&
+         gdk_color_state_equal (ka->color_state, kb->color_state);
+}
+
+/* Hash the texture's raw pixels. Returns FALSE (skip dedup) for very large
+ * textures, whose download+hash cost is not worth it and which rarely re-upload
+ * identically. gdk_texture_download() always yields GDK_MEMORY_DEFAULT
+ * (premultiplied BGRA, 4 bpp) regardless of native format, so hash that - but
+ * key on the NATIVE format and color state too: the wire PNG (gdkpng.c) encodes
+ * those, so identical 8-bit sRGB downloads can still differ on the wire. */
+static gboolean
+content_key_for_texture (GdkTexture *texture,
+                         ContentKey *key)
+{
+  int width = gdk_texture_get_width (texture);
+  int height = gdk_texture_get_height (texture);
+  gsize stride, size, i, n_words;
+  guchar *data;
+  const guchar *p;
+  guint64 h, h2;
+
+  if (width <= 0 || height <= 0 ||
+      (gint64) width * height > BROADWAY_CONTENT_CACHE_MAX_PIXELS)
+    return FALSE;
+
+  stride = (gsize) width * 4;
+  size = stride * height;
+  data = g_malloc (size);
+  gdk_texture_download (texture, data, stride);
+
+  /* FNV-1a-64, 8 bytes per multiply. The buffer is one contiguous g_malloc, so
+   * walk it as 64-bit words (memcpy: alignment/aliasing-safe) with a <8-byte tail.
+   * h2 is an MMIX-LCG mix over the same words: a second independent hash in the
+   * same pass, instead of keeping full pixel copies for byte compares. */
+  h = 1469598103934665603ULL;
+  h2 = 0;
+  n_words = size / 8;
+  p = data;
+  for (i = 0; i < n_words; i++, p += 8)
+    {
+      guint64 w;
+      memcpy (&w, p, 8);
+      h = (h ^ w) * 1099511628211ULL;
+      h2 = (h2 + w) * 6364136223846793005ULL + 1442695040888963407ULL;
+    }
+  for (i = n_words * 8; i < size; i++)
+    {
+      h = (h ^ data[i]) * 1099511628211ULL;
+      h2 = (h2 + data[i]) * 6364136223846793005ULL + 1442695040888963407ULL;
+    }
+
+  g_free (data);
+
+  key->hash = h;
+  key->hash2 = h2;
+  key->width = width;
+  key->height = height;
+  key->format = (int) gdk_texture_get_format (texture);
+  key->color_state = gdk_texture_get_color_state (texture); /* borrowed; texture outlives the lookup */
+  return TRUE;
+}
+
+static void
+content_cache_touch (GdkBroadwayDisplay *display,
+                     ContentCacheEntry  *entry)
+{
+  g_queue_unlink (&display->content_texture_lru, entry->lru_link);
+  g_queue_push_head_link (&display->content_texture_lru, entry->lru_link);
+}
+
+/* Release ids over the cap, but ONLY entries with no live GdkTexture owner
+ * (refcount == 0). Releasing an id a live texture still references would leave a
+ * dangling broadway-data and a node pointing at a freed browser texture, so live
+ * entries are kept even past the cap (bounded by GTK's own live-texture set). */
+static void
+content_cache_evict_if_needed (GdkBroadwayDisplay *display)
+{
+  GList *link = display->content_texture_lru.tail;
+
+  while (display->content_texture_count > BROADWAY_CONTENT_CACHE_MAX && link != NULL)
+    {
+      ContentCacheEntry *entry = link->data;
+      GList *prev = link->prev;
+
+      if (entry->refcount == 0)
+        {
+          g_hash_table_remove (display->content_texture_cache, &entry->key);
+          g_queue_delete_link (&display->content_texture_lru, link);
+          gdk_broadway_server_release_texture (display->server, entry->id);
+          gdk_color_state_unref (entry->key.color_state);
+          g_free (entry);
+          display->content_texture_count--;
+        }
+      link = prev;
+    }
+}
+
+static ContentCacheEntry *
+content_cache_insert (GdkBroadwayDisplay *display,
+                      const ContentKey   *key,
+                      guint32             id)
+{
+  ContentCacheEntry *entry = g_new0 (ContentCacheEntry, 1);
+
+  entry->key = *key;
+  gdk_color_state_ref (entry->key.color_state); /* entry outlives the texture */
+  entry->id = id;
+  entry->refcount = 1;
+  g_queue_push_head (&display->content_texture_lru, entry);
+  entry->lru_link = g_queue_peek_head_link (&display->content_texture_lru);
+  g_hash_table_insert (display->content_texture_cache, &entry->key, entry);
+  display->content_texture_count++;
+
+  content_cache_evict_if_needed (display);
+  return entry;
+}
+
+/* Free local memory only; broadwayd releases all of a client's textures on
+ * disconnect, so no per-id release is needed (and the server may be gone). */
+static void
+content_cache_destroy_all (GdkBroadwayDisplay *display)
+{
+  GList *l;
+
+  if (display->content_texture_cache == NULL)
+    return;
+
+  for (l = display->content_texture_lru.head; l != NULL; l = l->next)
+    {
+      ContentCacheEntry *entry = l->data;
+
+      gdk_color_state_unref (entry->key.color_state);
+      g_free (entry);
+    }
+  g_queue_clear (&display->content_texture_lru);
+  g_hash_table_destroy (display->content_texture_cache);
+  display->content_texture_cache = NULL;
+  display->content_texture_count = 0;
+}
+
 static void
 gdk_broadway_display_init (GdkBroadwayDisplay *display)
 {
   gdk_display_set_input_shapes (GDK_DISPLAY (display), FALSE);
 
   display->id_ht = g_hash_table_new (NULL, NULL);
+
+  display->content_texture_cache = g_hash_table_new (content_key_hash, content_key_equal);
+  g_queue_init (&display->content_texture_lru);
+  display->content_texture_count = 0;
 
   display->monitor = g_object_new (GDK_TYPE_BROADWAY_MONITOR,
                                    "display", display,
@@ -88,6 +284,7 @@ _gdk_broadway_display_size_changed (GdkDisplay                      *display,
   GdkMonitor *monitor;
   GdkRectangle current_size;
   GList *toplevels, *l;
+  gboolean scale_changed;
 
   monitor = broadway_display->monitor;
   gdk_monitor_get_geometry (monitor, &current_size);
@@ -97,6 +294,9 @@ _gdk_broadway_display_size_changed (GdkDisplay                      *display,
       (msg->scale == broadway_display->scale_factor ||
        broadway_display->fixed_scale))
     return;
+
+  scale_changed = !broadway_display->fixed_scale &&
+                  msg->scale != broadway_display->scale_factor;
 
   if (!broadway_display->fixed_scale)
     broadway_display->scale_factor = msg->scale;
@@ -109,12 +309,79 @@ _gdk_broadway_display_size_changed (GdkDisplay                      *display,
   for (l = toplevels; l != NULL; l = l->next)
     {
       GdkBroadwaySurface *toplevel = l->data;
+      GdkSurface *surface = GDK_SURFACE (toplevel);
 
       if (toplevel->maximized)
-        gdk_broadway_surface_move_resize (GDK_SURFACE (toplevel),
+        gdk_broadway_surface_move_resize (surface,
                                           0, 0,
                                           msg->width, msg->height);
+      else if (toplevel->visible)
+        {
+          /* Re-center a non-maximized toplevel on the resized screen, so a zoom
+           * change (which shrinks/grows the logical screen) can't leave a
+           * centered window stranded off-screen. */
+          int x = (msg->width - surface->width) / 2;
+          int y = (msg->height - surface->height) / 2;
+
+          gdk_broadway_surface_move_resize (surface, MAX (0, x), MAX (0, y),
+                                            surface->width, surface->height);
+        }
+
+      /* Scale changed: force full redraw so the renderer re-rasterizes cached
+       * textures at the new scale (pairs with the cache-drop in
+       * gskbroadwayrenderer.c). Else static surfaces stay blurry. */
+      if (scale_changed)
+        gdk_surface_invalidate_rect (surface, NULL);
     }
+}
+
+static void
+freeze_surface_for_suspend (gpointer key, gpointer value, gpointer user_data)
+{
+  GdkSurface *surface = value;
+  GdkBroadwaySurface *impl = GDK_BROADWAY_SURFACE (surface);
+
+  if (impl->suspend_frozen)
+    return;
+  impl->suspend_frozen = TRUE;
+  gdk_surface_freeze_updates (surface);
+}
+
+static void
+thaw_surface_for_suspend (gpointer key, gpointer value, gpointer user_data)
+{
+  GdkSurface *surface = value;
+  GdkBroadwaySurface *impl = GDK_BROADWAY_SURFACE (surface);
+
+  if (!impl->suspend_frozen)
+    return;
+  impl->suspend_frozen = FALSE;
+  gdk_surface_thaw_updates (surface);
+}
+
+/* The browser tab went hidden (suspended=TRUE) or visible (FALSE). Freeze every
+ * surface's update cycle so the frame clock skips its paint phase: the GSK
+ * Broadway renderer never runs, so no frames stream while hidden AND its diff
+ * baseline (last_root) stays put - the first paint after thaw is an incremental
+ * delta, not a full resync. The per-surface suspend_frozen flag keeps our extra
+ * freeze/thaw balanced even if surfaces are created or destroyed meanwhile (we
+ * only ever thaw what we actually froze). Idempotent, so a duplicate
+ * SUSPEND/RESUME from a reconnecting client is a no-op. */
+void
+_gdk_broadway_display_set_suspended (GdkDisplay *display,
+                                     gboolean    suspended)
+{
+  GdkBroadwayDisplay *broadway_display = GDK_BROADWAY_DISPLAY (display);
+
+  suspended = !!suspended;
+  if (broadway_display->suspended == suspended)
+    return;
+  broadway_display->suspended = suspended;
+
+  g_hash_table_foreach (broadway_display->id_ht,
+                        suspended ? freeze_surface_for_suspend
+                                  : thaw_surface_for_suspend,
+                        NULL);
 }
 
 static GdkDevice *
@@ -180,6 +447,8 @@ _gdk_broadway_display_open (const char *display_name)
   GError *error = NULL;
   GdkSeat *seat;
 
+  broadway_migrate_legacy_env ();
+
   display = g_object_new (GDK_TYPE_BROADWAY_DISPLAY, NULL);
   broadway_display = GDK_BROADWAY_DISPLAY (display);
 
@@ -208,7 +477,7 @@ _gdk_broadway_display_open (const char *display_name)
   gdk_event_init (display);
 
   if (display_name == NULL)
-    display_name = g_getenv ("BROADWAY_DISPLAY");
+    display_name = g_getenv ("BROTWAY_DISPLAY");
 
   broadway_display->server = _gdk_broadway_server_new (display, display_name, &error);
   if (broadway_display->server == NULL)
@@ -217,6 +486,10 @@ _gdk_broadway_display_open (const char *display_name)
       g_error_free (error);
       return NULL;
     }
+
+  display->clipboard = gdk_broadway_clipboard_new (display);
+
+  _gdk_broadway_display_init_settings (display);
 
   g_signal_emit_by_name (display, "opened");
 
@@ -287,6 +560,10 @@ gdk_broadway_display_finalize (GObject *object)
 
   _gdk_broadway_cursor_display_finalize (GDK_DISPLAY(broadway_display));
 
+  _gdk_broadway_display_finalize_settings (GDK_DISPLAY (broadway_display));
+
+  content_cache_destroy_all (broadway_display);
+
   g_object_unref (broadway_display->monitor);
 
   G_OBJECT_CLASS (gdk_broadway_display_parent_class)->finalize (object);
@@ -337,6 +614,25 @@ gdk_broadway_display_hide_keyboard (GdkBroadwayDisplay *display)
   g_return_if_fail (GDK_IS_BROADWAY_DISPLAY (display));
 
   _gdk_broadway_server_set_show_keyboard (display->server, FALSE);
+}
+
+/*
+ * gdk_broadway_display_show_uri:
+ * @display: a broadway display
+ * @uri: the URI to open
+ *
+ * Asks the browser viewing the Broadway session to open @uri in a new tab.
+ * There is no system URI handler in a headless Broadway/container session, so
+ * this routes the URI over the protocol to the browser instead.
+ */
+void
+gdk_broadway_display_show_uri (GdkBroadwayDisplay *display,
+                               const char         *uri)
+{
+  g_return_if_fail (GDK_IS_BROADWAY_DISPLAY (display));
+  g_return_if_fail (uri != NULL);
+
+  _gdk_broadway_server_open_uri (display->server, uri);
 }
 
 /**
@@ -409,18 +705,12 @@ gdk_broadway_display_get_monitors (GdkDisplay *display)
   return G_LIST_MODEL (self->monitors);
 }
 
-static gboolean
-gdk_broadway_display_get_setting (GdkDisplay *display,
-                                  const char *name,
-                                  GValue     *value)
-{
-  return FALSE;
-}
-
 typedef struct {
   int id;
   GdkDisplay *display;
   GList *textures;
+  ContentCacheEntry *entry;  /* non-NULL: a cache entry shares this id (refcounted);
+                              * NULL: legacy/oversized, this object owns the id */
 } BroadwayTextureData;
 
 static void
@@ -428,9 +718,27 @@ broadway_texture_data_free (BroadwayTextureData *data)
 {
   GdkBroadwayDisplay *broadway_display = GDK_BROADWAY_DISPLAY (data->display);
 
-  gdk_broadway_server_release_texture (broadway_display->server, data->id);
+  if (data->entry != NULL)
+    data->entry->refcount--;   /* keep the id cached for reuse; released on eviction */
+  else
+    gdk_broadway_server_release_texture (broadway_display->server, data->id);
   g_object_unref (data->display);
   g_free (data);
+}
+
+static void
+attach_broadway_data (GdkDisplay        *display,
+                      GdkTexture        *texture,
+                      guint32            id,
+                      ContentCacheEntry *entry)
+{
+  BroadwayTextureData *data = g_new0 (BroadwayTextureData, 1);
+
+  data->id = id;
+  data->display = g_object_ref (display);
+  data->entry = entry;
+  g_object_set_data_full (G_OBJECT (texture), "broadway-data", data,
+                          (GDestroyNotify) broadway_texture_data_free);
 }
 
 guint32
@@ -439,19 +747,43 @@ gdk_broadway_display_ensure_texture (GdkDisplay *display,
 {
   GdkBroadwayDisplay *broadway_display = GDK_BROADWAY_DISPLAY (display);
   BroadwayTextureData *data;
+  ContentCacheEntry *entry;
+  ContentKey key;
+  guint32 id;
 
+  /* Fast path: this exact object was already uploaded - no re-hash. */
   data = g_object_get_data (G_OBJECT (texture), "broadway-data");
-  if (data == NULL)
+  if (data != NULL)
     {
-      guint32 id = gdk_broadway_server_upload_texture (broadway_display->server, texture);
-
-      data = g_new0 (BroadwayTextureData, 1);
-      data->id = id;
-      data->display = g_object_ref (display);
-     g_object_set_data_full (G_OBJECT (texture), "broadway-data", data, (GDestroyNotify)broadway_texture_data_free);
+      /* Keep a still-referenced texture hot so a per-frame redraw isn't evicted
+       * early. entry is NULL on the legacy/oversized path (no LRU link). */
+      if (data->entry != NULL)
+        content_cache_touch (broadway_display, data->entry);
+      return data->id;
     }
 
-  return data->id;
+  if (content_key_for_texture (texture, &key))
+    {
+      entry = g_hash_table_lookup (broadway_display->content_texture_cache, &key);
+      if (entry != NULL)
+        {
+          /* Identical pixels already on the wire: reuse the id, skip the upload. */
+          entry->refcount++;
+          content_cache_touch (broadway_display, entry);
+          attach_broadway_data (display, texture, entry->id, entry);
+          return entry->id;
+        }
+
+      id = gdk_broadway_server_upload_texture (broadway_display->server, texture);
+      entry = content_cache_insert (broadway_display, &key, id);
+      attach_broadway_data (display, texture, id, entry);
+      return id;
+    }
+
+  /* Oversized / un-hashable: legacy path, the object owns the id. */
+  id = gdk_broadway_server_upload_texture (broadway_display->server, texture);
+  attach_broadway_data (display, texture, id, NULL);
+  return id;
 }
 
 static void
@@ -501,5 +833,5 @@ gdk_broadway_display_class_init (GdkBroadwayDisplayClass * class)
   display_class->get_keymap = _gdk_broadway_display_get_keymap;
 
   display_class->get_monitors = gdk_broadway_display_get_monitors;
-  display_class->get_setting = gdk_broadway_display_get_setting;
+  display_class->get_setting = _gdk_broadway_display_get_setting;
 }

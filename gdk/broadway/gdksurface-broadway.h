@@ -45,6 +45,9 @@ struct _GdkBroadwaySurface
   GdkSurface parent_instance;
 
   GdkCursor *cursor;
+  char *cursor_name;  /* last CSS cursor name sent to the browser (dedup) */
+  char *title;        /* last window title sent to the browser (dedup) */
+  GBytes *icon_png;   /* last icon PNG sent to the browser (dedup) */
 
   int id;
 
@@ -63,6 +66,7 @@ struct _GdkBroadwaySurface
   gboolean dirty;
   gboolean last_synced;
   gboolean modal_hint;
+  gboolean suspend_frozen; /* we issued an extra freeze_updates for tab-suspend */
 
   GdkGeometry geometry_hints;
   GdkSurfaceHints geometry_hints_mask;

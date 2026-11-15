@@ -18,6 +18,8 @@
 #endif
 
 #include "broadway-server.h"
+#include "broadway-env.h"
+#include "broadway-portal.h"
 
 BroadwayServer *server;
 GList *clients;
@@ -60,6 +62,39 @@ typedef struct  {
   GHashTable *textures;
 } BroadwayClient;
 
+/* Clipboard reads are asynchronous: a client's REQUEST_CLIPBOARD goes out to the
+ * browser and the answer comes back later as a CLIPBOARD_CONTENTS event. Each
+ * request is tagged with an id so the reply is routed back to the one client
+ * that asked (with the originating serial), instead of being broadcast. */
+typedef struct {
+  guint32 id;
+  BroadwayClient *client;
+  guint32 serial;
+} PendingClipboardRequest;
+
+#define MAX_PENDING_CLIPBOARD_REQUESTS 64
+static GList *pending_clipboard_requests;
+static guint32 next_clipboard_request_id = 1;
+
+static void
+forget_clipboard_requests_for_client (BroadwayClient *client)
+{
+  GList *l = pending_clipboard_requests;
+
+  while (l != NULL)
+    {
+      GList *next = l->next;
+      PendingClipboardRequest *pending = l->data;
+
+      if (pending->client == client)
+        {
+          g_free (pending);
+          pending_clipboard_requests = g_list_delete_link (pending_clipboard_requests, l);
+        }
+      l = next;
+    }
+}
+
 static void
 close_fd (void *data)
 {
@@ -71,6 +106,7 @@ client_free (BroadwayClient *client)
 {
   g_assert (client->surfaces == NULL);
   g_assert (client->disconnect_idle == 0);
+  forget_clipboard_requests_for_client (client);
   clients = g_list_remove (clients, client);
   g_object_unref (client->connection);
   g_object_unref (client->in);
@@ -122,16 +158,16 @@ client_disconnect_in_idle (BroadwayClient *client)
 }
 
 static void
-send_reply (BroadwayClient *client,
-            BroadwayRequest *request,
-            BroadwayReply *reply,
-            gsize size,
-            guint32 type)
+send_reply_to_serial (BroadwayClient *client,
+                      guint32 in_reply_to,
+                      BroadwayReply *reply,
+                      gsize size,
+                      guint32 type)
 {
   GOutputStream *output;
 
   reply->base.size = size;
-  reply->base.in_reply_to = request ? request->base.serial : 0;
+  reply->base.in_reply_to = in_reply_to;
   reply->base.type = type;
 
   output = g_io_stream_get_output_stream (G_IO_STREAM (client->connection));
@@ -140,6 +176,17 @@ send_reply (BroadwayClient *client,
       g_printerr ("can't write to client");
       client_disconnect_in_idle (client);
     }
+}
+
+static void
+send_reply (BroadwayClient *client,
+            BroadwayRequest *request,
+            BroadwayReply *reply,
+            gsize size,
+            guint32 type)
+{
+  send_reply_to_serial (client, request ? request->base.serial : 0,
+                        reply, size, type);
 }
 
 static void
@@ -224,7 +271,8 @@ client_handle_request (BroadwayClient *client,
                                      request->new_surface.x,
                                      request->new_surface.y,
                                      request->new_surface.width,
-                                     request->new_surface.height);
+                                     request->new_surface.height,
+                                     request->new_surface.is_popup);
       client->surfaces =
         g_list_prepend (client->surfaces,
                         GUINT_TO_POINTER (reply.new_surface.id));
@@ -374,6 +422,99 @@ client_handle_request (BroadwayClient *client,
                                               request->set_modal_hint.id,
                                               request->set_modal_hint.modal_hint);
       break;
+    case BROADWAY_REQUEST_SET_KEEP_ABOVE:
+      broadway_server_surface_set_keep_above (server,
+                                              request->set_keep_above.id,
+                                              request->set_keep_above.keep_above);
+      break;
+    case BROADWAY_REQUEST_SET_INPUT_REGION:
+      broadway_server_surface_set_input_region (server,
+                                                request->set_input_region.id,
+                                                request->set_input_region.mode,
+                                                &request->set_input_region.rect);
+      break;
+    case BROADWAY_REQUEST_SET_CLIPBOARD:
+      /* A size below the fixed header would wrap the clamp; ignore it. */
+      if (request->base.size >= G_STRUCT_OFFSET (BroadwayRequestSetClipboard, text))
+        {
+          /* Don't trust the wire len: clamp to what the framed request actually
+           * carries, so a bogus len can't read past the request buffer. */
+          gsize max = request->base.size -
+                      G_STRUCT_OFFSET (BroadwayRequestSetClipboard, text);
+          guint32 len = request->set_clipboard.len > max
+                        ? (guint32) max : request->set_clipboard.len;
+          broadway_server_set_clipboard (server, request->set_clipboard.text, len);
+        }
+      break;
+    case BROADWAY_REQUEST_OPEN_URI:
+      if (request->base.size >= G_STRUCT_OFFSET (BroadwayRequestOpenUri, uri))
+        {
+          /* Clamp the wire len to the framed request, same as SET_CLIPBOARD. */
+          gsize max = request->base.size -
+                      G_STRUCT_OFFSET (BroadwayRequestOpenUri, uri);
+          guint32 len = request->open_uri.len > max
+                        ? (guint32) max : request->open_uri.len;
+          broadway_server_open_uri (server, request->open_uri.uri, len);
+        }
+      break;
+    case BROADWAY_REQUEST_SET_CURSOR:
+      if (request->base.size >= G_STRUCT_OFFSET (BroadwayRequestSetCursor, name))
+        {
+          /* Clamp the wire len to the framed request, same as SET_CLIPBOARD. */
+          gsize max = request->base.size -
+                      G_STRUCT_OFFSET (BroadwayRequestSetCursor, name);
+          guint32 len = request->set_cursor.len > max
+                        ? (guint32) max : request->set_cursor.len;
+          broadway_server_surface_set_cursor (server, request->set_cursor.id,
+                                              request->set_cursor.name, len);
+        }
+      break;
+    case BROADWAY_REQUEST_SET_TITLE:
+      if (request->base.size >= G_STRUCT_OFFSET (BroadwayRequestSetTitle, title))
+        {
+          /* Clamp the wire len to the framed request, same as SET_CLIPBOARD. */
+          gsize max = request->base.size -
+                      G_STRUCT_OFFSET (BroadwayRequestSetTitle, title);
+          guint32 len = request->set_title.len > max
+                        ? (guint32) max : request->set_title.len;
+          broadway_server_surface_set_title (server, request->set_title.id,
+                                             request->set_title.title, len);
+        }
+      break;
+    case BROADWAY_REQUEST_SET_ICON:
+      if (request->base.size >= G_STRUCT_OFFSET (BroadwayRequestSetIcon, data))
+        {
+          /* Clamp the wire len to the framed request, same as SET_CLIPBOARD. */
+          gsize max = request->base.size -
+                      G_STRUCT_OFFSET (BroadwayRequestSetIcon, data);
+          guint32 len = request->set_icon.len > max
+                        ? (guint32) max : request->set_icon.len;
+          broadway_server_surface_set_icon (server, request->set_icon.id,
+                                            (const guchar *) request->set_icon.data, len);
+        }
+      break;
+    case BROADWAY_REQUEST_REQUEST_CLIPBOARD:
+      {
+        PendingClipboardRequest *pending = g_new (PendingClipboardRequest, 1);
+
+        pending->id = next_clipboard_request_id++;
+        pending->client = client;
+        pending->serial = request->base.serial;
+        pending_clipboard_requests = g_list_append (pending_clipboard_requests, pending);
+
+        /* Bound memory if some requests never get answered (e.g. browser gone).
+         * The list grows by one per request, so at most one entry is ever over
+         * the cap — a single check suffices (no need to re-walk the list). */
+        if (g_list_length (pending_clipboard_requests) > MAX_PENDING_CLIPBOARD_REQUESTS)
+          {
+            GList *oldest = pending_clipboard_requests;
+            g_free (oldest->data);
+            pending_clipboard_requests = g_list_delete_link (pending_clipboard_requests, oldest);
+          }
+
+        broadway_server_request_clipboard (server, pending->id);
+      }
+      break;
     default:
       g_warning ("Unknown request of type %d", request->base.type);
     }
@@ -456,6 +597,14 @@ client_input_cb (GPollableInputStream *stream,
       guint32 size;
 
       memcpy (&size, buffer, sizeof (guint32));
+      if (size < sizeof (BroadwayRequestBase))
+        {
+          /* Framing too small for even the header; no way to resync. */
+          g_printerr ("Invalid request size %u, dropping client\n", size);
+          client->source = NULL;
+          client_disconnected (client);
+          return G_SOURCE_REMOVE;
+        }
       if (size <= buffer_len)
         {
           client_handle_request (client, (BroadwayRequest *)buffer);
@@ -483,6 +632,7 @@ incoming_client (GSocketService    *service,
 
   client = g_new0 (BroadwayClient, 1);
   client->id = client_id_count++;
+  broadway_server_client_connected (server, client->id);
   client->connection = g_object_ref (connection);
   client->textures = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, NULL);
 
@@ -539,6 +689,8 @@ main (int argc, char *argv[])
   };
 
   setlocale (LC_ALL, "");
+
+  broadway_migrate_legacy_env ();
 
   context = g_option_context_new ("[:DISPLAY] - broadway display daemon");
   g_option_context_add_main_entries (context, entries, GETTEXT_PACKAGE);
@@ -602,6 +754,13 @@ main (int argc, char *argv[])
       return 1;
     }
 
+  /* So the daemon can spawn the debug-menu client on our own display. */
+  broadway_server_set_display (server, display);
+
+  /* Serve org.freedesktop.portal.Settings so libadwaita apps follow the
+   * browser's prefers-color-scheme (updated on COLOR_SCHEME events). */
+  broadway_portal_start ();
+
   listener = g_socket_service_new ();
   if (!g_socket_listener_add_address (G_SOCKET_LISTENER (listener),
                                       address,
@@ -656,6 +815,11 @@ get_event_size (int type)
       return sizeof (BroadwayInputScreenResizeNotify);
     case BROADWAY_EVENT_FOCUS:
       return sizeof (BroadwayInputFocusMsg);
+    case BROADWAY_EVENT_SUSPEND:
+    case BROADWAY_EVENT_RESUME:
+      return sizeof (BroadwayInputBaseMsg);
+    case BROADWAY_EVENT_SET_PNG:
+      return sizeof (BroadwayInputSetPngMsg);
     default:
       g_assert_not_reached ();
     }
@@ -693,4 +857,45 @@ broadway_events_got_input (BroadwayInputMsg *message,
                       BROADWAY_REPLY_EVENT);
         }
     }
+}
+
+void
+broadway_clipboard_contents_received (guint32     id,
+                                      const char *text,
+                                      gsize       len)
+{
+  GList *l;
+  PendingClipboardRequest *pending = NULL;
+  gsize size;
+  BroadwayReplyClipboard *reply;
+
+  /* Route the answer only to the client that requested it (matched by id). */
+  for (l = pending_clipboard_requests; l != NULL; l = l->next)
+    {
+      PendingClipboardRequest *p = l->data;
+      if (p->id == id)
+        {
+          pending = p;
+          break;
+        }
+    }
+
+  if (pending == NULL)
+    return; /* unknown/stale request (timed out, client gone, or spurious) */
+
+  size = G_STRUCT_OFFSET (BroadwayReplyClipboard, text) + len;
+  /* Allocate at least the full struct so accessing reply->len stays in bounds
+   * (the text[1] member makes sizeof larger than size when len is small). */
+  reply = g_malloc0 (MAX (size + 1, sizeof *reply));
+  reply->len = (guint32) len;
+  if (len > 0)
+    memcpy (reply->text, text, len);
+
+  send_reply_to_serial (pending->client, pending->serial,
+                        (BroadwayReply *) reply, size, BROADWAY_REPLY_CLIPBOARD);
+
+  g_free (reply);
+
+  pending_clipboard_requests = g_list_remove (pending_clipboard_requests, pending);
+  g_free (pending);
 }

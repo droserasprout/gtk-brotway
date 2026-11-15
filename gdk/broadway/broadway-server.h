@@ -7,6 +7,10 @@
 void broadway_events_got_input (BroadwayInputMsg *message,
 				gint32 client_id);
 
+void broadway_clipboard_contents_received (guint32     id,
+                                           const char *text,
+                                           gsize       len);
+
 typedef struct _BroadwayServer BroadwayServer;
 typedef struct _BroadwayServerClass BroadwayServerClass;
 
@@ -82,12 +86,33 @@ guint32             broadway_server_ungrab_pointer            (BroadwayServer  *
                                                                guint32          time_);
 void                broadway_server_set_show_keyboard         (BroadwayServer  *server,
                                                                gboolean         show);
+void                broadway_server_set_clipboard             (BroadwayServer  *server,
+                                                               const char      *text,
+                                                               gsize            len);
+void                broadway_server_request_clipboard         (BroadwayServer  *server,
+                                                               guint32          id);
+void                broadway_server_open_uri                  (BroadwayServer  *server,
+                                                               const char      *uri,
+                                                               gsize            len);
+void                broadway_server_surface_set_cursor        (BroadwayServer  *server,
+                                                               int              id,
+                                                               const char      *name,
+                                                               gsize            len);
+void                broadway_server_surface_set_title         (BroadwayServer  *server,
+                                                               int              id,
+                                                               const char      *title,
+                                                               gsize            len);
+void                broadway_server_surface_set_icon          (BroadwayServer  *server,
+                                                               int              id,
+                                                               const guchar    *data,
+                                                               gsize            len);
 guint32             broadway_server_new_surface               (BroadwayServer  *server,
                                                                guint32          client,
                                                                int              x,
                                                                int              y,
                                                                int              width,
-                                                               int              height);
+                                                               int              height,
+                                                               gboolean         is_popup);
 void                broadway_server_destroy_surface           (BroadwayServer  *server,
                                                                int              id,
                                                                gboolean         disconnected);
@@ -123,5 +148,20 @@ void                broadway_server_focus_surface             (BroadwayServer  *
 void                broadway_server_surface_set_modal_hint    (BroadwayServer *server,
                                                                int             id,
                                                                gboolean        modal_hint);
+void                broadway_server_surface_set_keep_above     (BroadwayServer *server,
+                                                               int             id,
+                                                               gboolean        keep_above);
+void                broadway_server_surface_set_input_region  (BroadwayServer *server,
+                                                               int             id,
+                                                               int             mode,
+                                                               BroadwayRect   *rect);
+/* The daemon's own display string (":N"), used to spawn the debug-menu client
+ * so it connects back to this same display. */
+void                broadway_server_set_display               (BroadwayServer *server,
+                                                               const char     *display);
+/* Called by the daemon when a GTK client connects, so the server knows which
+ * clients predate a debug-menu summon. */
+void                broadway_server_client_connected          (BroadwayServer *server,
+                                                               guint32         client_id);
 
 

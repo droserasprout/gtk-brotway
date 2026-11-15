@@ -14,11 +14,30 @@
  *                Basic I/O primitives                                  *
  ************************************************************************/
 
+#define BROADWAY_OUTPUT_IV_RING 64
+/* Intervals longer than this are treated as idle gaps (the app stopped pushing
+ * frames) rather than stutter, and are kept out of the pacing ring so p95/max
+ * reflect only back-to-back frames. 250ms = a 4fps floor for "still animating". */
+#define BROADWAY_OUTPUT_IDLE_CUTOFF_US (250 * 1000)
+
 struct BroadwayOutput {
   GOutputStream *out;
   GString *buf;
   int error;
   guint32 serial;
+  guint64 bytes_sent;   /* payload bytes flushed to the browser (this connection) */
+  guint32 frames;       /* non-empty flushes ~ display pushes (this connection) */
+
+  /* Smoothness instrumentation for the debug menu (microseconds). Interval =
+   * gap between real flushes (pacing); write = time blocked in the socket
+   * writev (transmit + backpressure). */
+  gint64  last_flush_us;
+  guint32 iv_ring[BROADWAY_OUTPUT_IV_RING];   /* rolling frame-to-frame intervals */
+  guint8  iv_head;
+  guint8  iv_count;
+  guint64 write_us_sum;                       /* windowed: reset on read */
+  guint32 write_us_max;
+  guint32 write_samples;
 };
 
 static void
@@ -49,9 +68,22 @@ broadway_output_send_cmd (BroadwayOutput *output,
       p += 8;
     }
   // FIXME: if we are paranoid we should 'mask' the data
-  // FIXME: we should really emit these as a single write
-  g_output_stream_write_all (output->out, header, p, NULL, NULL, NULL);
-  g_output_stream_write_all (output->out, buf, count, NULL, NULL, NULL);
+  /* One vectored write instead of two syscalls, and no payload copy. */
+  if (count > 0)
+    {
+      GOutputVector vectors[2];
+
+      vectors[0].buffer = header;
+      vectors[0].size = p;
+      vectors[1].buffer = buf;
+      vectors[1].size = count;
+
+      g_output_stream_writev_all (output->out, vectors, 2, NULL, NULL, NULL);
+    }
+  else
+    {
+      g_output_stream_write_all (output->out, header, p, NULL, NULL, NULL);
+    }
 }
 
 void broadway_output_pong (BroadwayOutput *output)
@@ -59,16 +91,60 @@ void broadway_output_pong (BroadwayOutput *output)
   broadway_output_send_cmd (output, TRUE, BROADWAY_WS_CNX_PONG, NULL, 0);
 }
 
+/* A big texture frame can grow buf to many MB; set_size(0) keeps that capacity
+ * forever. After an oversized flush, free it and start small instead. */
+#define BROADWAY_OUTPUT_BUF_SHRINK_THRESHOLD (256 * 1024)
+
 int
 broadway_output_flush (BroadwayOutput *output)
 {
+  gsize flushed_len;
+
+  gint64 t0;
+
   if (output->buf->len == 0)
     return TRUE;
+
+  /* Pacing: record the gap since the previous real flush, but skip idle gaps so
+   * p95/max measure stutter during continuous rendering, not time spent idle. */
+  t0 = g_get_monotonic_time ();
+  if (output->last_flush_us != 0)
+    {
+      guint32 iv = (guint32) (t0 - output->last_flush_us);
+      if (iv <= BROADWAY_OUTPUT_IDLE_CUTOFF_US)
+        {
+          output->iv_ring[output->iv_head] = iv;
+          output->iv_head = (output->iv_head + 1) % BROADWAY_OUTPUT_IV_RING;
+          if (output->iv_count < BROADWAY_OUTPUT_IV_RING)
+            output->iv_count++;
+        }
+    }
+  output->last_flush_us = t0;
 
   broadway_output_send_cmd (output, TRUE, BROADWAY_WS_BINARY,
                             output->buf->str, output->buf->len);
 
-  g_string_set_size (output->buf, 0);
+  /* Write time: how long the (blocking) socket writev took = backpressure. */
+  {
+    guint32 w = (guint32) (g_get_monotonic_time () - t0);
+    output->write_us_sum += w;
+    output->write_samples++;
+    if (w > output->write_us_max)
+      output->write_us_max = w;
+  }
+
+  output->bytes_sent += output->buf->len;
+  output->frames++;
+
+  flushed_len = output->buf->len;
+
+  if (flushed_len > BROADWAY_OUTPUT_BUF_SHRINK_THRESHOLD)
+    {
+      g_string_free (output->buf, TRUE);
+      output->buf = g_string_new ("");
+    }
+  else
+    g_string_set_size (output->buf, 0);
 
   return !output->error;
 
@@ -92,6 +168,7 @@ void
 broadway_output_free (BroadwayOutput *output)
 {
   g_object_unref (output->out);
+  g_string_free (output->buf, TRUE);
   free (output);
 }
 
@@ -99,6 +176,56 @@ guint32
 broadway_output_get_next_serial (BroadwayOutput *output)
 {
   return output->serial;
+}
+
+guint64
+broadway_output_get_bytes_sent (BroadwayOutput *output)
+{
+  return output->bytes_sent;
+}
+
+guint32
+broadway_output_get_frames (BroadwayOutput *output)
+{
+  return output->frames;
+}
+
+static int
+cmp_u32 (const void *a, const void *b)
+{
+  guint32 x = *(const guint32 *) a, y = *(const guint32 *) b;
+  return (x > y) - (x < y);
+}
+
+/* Debug-menu pacing stats (microseconds). Interval p95/max are taken over a
+ * rolling ring of recent frames; write avg/max are windowed and reset on read. */
+void
+broadway_output_get_pacing (BroadwayOutput *output,
+                            guint32 *iv_p95_us, guint32 *iv_max_us,
+                            guint32 *write_avg_us, guint32 *write_max_us)
+{
+  guint32 sorted[BROADWAY_OUTPUT_IV_RING];
+  guint n = output->iv_count;
+
+  if (n > 0)
+    {
+      memcpy (sorted, output->iv_ring, n * sizeof (guint32));
+      qsort (sorted, n, sizeof (guint32), cmp_u32);
+      *iv_p95_us = sorted[(guint) ((n - 1) * 0.95)];
+      *iv_max_us = sorted[n - 1];
+    }
+  else
+    {
+      *iv_p95_us = 0;
+      *iv_max_us = 0;
+    }
+
+  *write_avg_us = output->write_samples ? (guint32) (output->write_us_sum / output->write_samples) : 0;
+  *write_max_us = output->write_us_max;
+
+  output->write_us_sum = 0;
+  output->write_samples = 0;
+  output->write_us_max = 0;
 }
 
 void
@@ -217,6 +344,39 @@ broadway_output_disconnected (BroadwayOutput *output)
 }
 
 void
+broadway_output_session (BroadwayOutput *output, guint32 token, guint32 client_id)
+{
+  write_header (output, BROADWAY_OP_SESSION);
+  append_uint32 (output, token);
+  append_uint32 (output, client_id);
+}
+
+/* Reply to a client heartbeat over the data channel; a WebSocket control pong
+ * is invisible to the page's onmessage handler. */
+void
+broadway_output_pong_msg (BroadwayOutput *output)
+{
+  write_header (output, BROADWAY_OP_PONG);
+}
+
+void
+broadway_output_debug_flash (BroadwayOutput *output, gboolean enabled)
+{
+  write_header (output, BROADWAY_OP_DEBUG_FLASH);
+  append_uint8 (output, enabled ? 1 : 0);
+}
+
+/* Pin the browser's logical screen to w x h at integer scale; (0,0,0) unpins. */
+void
+broadway_output_debug_set_screen (BroadwayOutput *output, int w, int h, int scale)
+{
+  write_header (output, BROADWAY_OP_DEBUG_SET_SCREEN);
+  append_uint16 (output, w);
+  append_uint16 (output, h);
+  append_uint8 (output, scale);
+}
+
+void
 broadway_output_show_surface(BroadwayOutput *output,  int id)
 {
   write_header (output, BROADWAY_OP_SHOW_SURFACE);
@@ -267,6 +427,104 @@ broadway_output_set_show_keyboard (BroadwayOutput *output,
 {
   write_header (output, BROADWAY_OP_SET_SHOW_KEYBOARD);
   append_uint16 (output, show);
+}
+
+void
+broadway_output_set_input_region (BroadwayOutput *output,
+                                  int id, int mode, BroadwayRect *rect)
+{
+  write_header (output, BROADWAY_OP_SET_INPUT_REGION);
+  append_uint16 (output, id);
+  append_uint16 (output, mode);
+  append_uint16 (output, mode == 2 ? rect->x : 0);
+  append_uint16 (output, mode == 2 ? rect->y : 0);
+  append_uint16 (output, mode == 2 ? rect->width : 0);
+  append_uint16 (output, mode == 2 ? rect->height : 0);
+}
+
+void
+broadway_output_set_modal (BroadwayOutput *output,
+                           int             id,
+                           gboolean        modal)
+{
+  write_header (output, BROADWAY_OP_SET_MODAL);
+  append_uint16 (output, id);
+  append_bool (output, modal);
+}
+
+void
+broadway_output_reassert_pointer (BroadwayOutput *output,
+                                  int id, int x, int y)
+{
+  write_header (output, BROADWAY_OP_REASSERT_POINTER);
+  append_uint16 (output, id);
+  append_uint16 (output, x);
+  append_uint16 (output, y);
+}
+
+void
+broadway_output_set_clipboard (BroadwayOutput *output,
+                               const char     *text,
+                               gsize           len)
+{
+  write_header (output, BROADWAY_OP_SET_CLIPBOARD);
+  append_uint32 (output, (guint32) len);
+  g_string_append_len (output->buf, text, len);
+}
+
+void
+broadway_output_request_clipboard (BroadwayOutput *output,
+                                   guint32         id)
+{
+  write_header (output, BROADWAY_OP_REQUEST_CLIPBOARD);
+  append_uint32 (output, id);
+}
+
+void
+broadway_output_open_uri (BroadwayOutput *output,
+                          const char     *uri,
+                          gsize           len)
+{
+  write_header (output, BROADWAY_OP_OPEN_URI);
+  append_uint32 (output, (guint32) len);
+  g_string_append_len (output->buf, uri, len);
+}
+
+void
+broadway_output_set_cursor (BroadwayOutput *output,
+                            int             id,
+                            const char     *name,
+                            gsize           len)
+{
+  write_header (output, BROADWAY_OP_SET_CURSOR);
+  append_uint16 (output, id);
+  append_uint32 (output, (guint32) len);
+  g_string_append_len (output->buf, name, len);
+}
+
+void
+broadway_output_set_title (BroadwayOutput *output,
+                           int             id,
+                           const char     *title,
+                           gsize           len)
+{
+  write_header (output, BROADWAY_OP_SET_TITLE);
+  append_uint16 (output, id);
+  append_uint32 (output, (guint32) len);
+  g_string_append_len (output->buf, title, len);
+}
+
+void
+broadway_output_set_icon (BroadwayOutput *output,
+                          int             id,
+                          const guchar   *data,
+                          gsize           len)
+{
+  write_header (output, BROADWAY_OP_SET_ICON);
+  append_uint16 (output, id);
+  append_uint32 (output, (guint32) len);
+  if (len > 0)
+    g_string_append_len (output->buf, (const char *) data, len);
 }
 
 void
@@ -570,7 +828,8 @@ broadway_output_surface_set_nodes (BroadwayOutput *output,
                                    BroadwayNode   *old_root,
                                    GHashTable     *old_node_lookup)
 {
-  gsize size_pos, start, end;
+  gsize header_pos, size_pos, start, end;
+  guint32 saved_serial;
 
 
   if (old_root)
@@ -580,6 +839,9 @@ broadway_output_surface_set_nodes (BroadwayOutput *output,
       /* This will modify children of old_root if any are shared */
       broadway_node_mark_deep_reused (root, TRUE);
     }
+
+  header_pos = output->buf->len;
+  saved_serial = output->serial;
 
   write_header (output, BROADWAY_OP_SET_NODES);
 
@@ -596,6 +858,16 @@ broadway_output_surface_set_nodes (BroadwayOutput *output,
   if (old_root)
     append_node_removes (output, old_root);
   end = output->buf->len;
+
+  /* No ops: the client tree already matches, so drop the empty SET_NODES
+   * rather than send a no-op. Roll the serial back too. */
+  if (end == start)
+    {
+      g_string_set_size (output->buf, header_pos);
+      output->serial = saved_serial;
+      return;
+    }
+
   patch_uint32 (output, (end - start) / 4, size_pos);
 }
 

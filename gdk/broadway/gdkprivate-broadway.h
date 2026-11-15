@@ -50,6 +50,7 @@ GdkDrag * _gdk_broadway_surface_drag_begin        (GdkSurface          *surface,
                                                    GdkDragAction       actions,
                                                    double              dx,
                                                    double              dy);
+GdkSurface * gdk_broadway_drag_surface_new        (GdkDisplay *display);
 gboolean _gdk_broadway_moveresize_handle_event    (GdkDisplay *display,
                                                    BroadwayInputMsg *event);
 gboolean _gdk_broadway_moveresize_configure_done  (GdkDisplay *display,
@@ -70,10 +71,30 @@ void gdk_broadway_surface_move_resize (GdkSurface *surface,
 void _gdk_broadway_display_size_changed (GdkDisplay *display,
                                          BroadwayInputScreenResizeNotify *msg);
 
+void _gdk_broadway_display_set_suspended (GdkDisplay *display,
+                                          gboolean    suspended);
+
 void _gdk_broadway_events_got_input      (GdkDisplay *display,
                                           BroadwayInputMsg *message);
 
+void _gdk_broadway_server_set_png_preset (int preset);
+
+void          _gdk_broadway_server_set_clipboard_text     (GdkBroadwayServer *server,
+                                                           const char        *text);
+guint32       _gdk_broadway_server_request_clipboard      (GdkBroadwayServer *server);
+
+GdkClipboard *gdk_broadway_clipboard_new                  (GdkDisplay *display);
+void          _gdk_broadway_clipboard_contents_received   (GdkDisplay *display,
+                                                           guint32     in_reply_to,
+                                                           const char *text,
+                                                           gsize       len);
+
 GdkDisplay * _gdk_broadway_display_open (const char *display_name);
+void     _gdk_broadway_display_init_settings     (GdkDisplay *display);
+void     _gdk_broadway_display_finalize_settings (GdkDisplay *display);
+gboolean _gdk_broadway_display_get_setting       (GdkDisplay *display,
+                                                  const char *name,
+                                                  GValue     *value);
 void _gdk_broadway_display_queue_events (GdkDisplay *display);
 GdkKeymap* _gdk_broadway_display_get_keymap (GdkDisplay *display);
 

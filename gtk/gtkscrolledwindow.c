@@ -1278,8 +1278,15 @@ captured_motion (GtkEventController *controller,
   GdkModifierType state;
   GdkEvent *event;
   GtkWidget *target;
+  gboolean moved;
 
-  if (priv->prev_x != x || priv->prev_y != y)
+  /* A relayout under a stationary pointer triggers a synthetic motion at the
+   * same coords (gtkwindow request_motion -> gdk_surface_ensure_motion), so
+   * track real movement and don't re-show the overlay scrollbar on every
+   * content refresh (issue #16). */
+  moved = priv->prev_x != x || priv->prev_y != y;
+
+  if (moved)
     {
       gtk_scrolled_window_decelerate (sw, 0, 0);
       priv->prev_x = x;
@@ -1299,10 +1306,15 @@ captured_motion (GtkEventController *controller,
   source_device = gdk_event_get_device (event);
   input_source = gdk_device_get_source (source_device);
 
-  if (priv->hscrollbar_visible)
-    indicator_start_fade (&priv->hindicator, 1.0);
-  if (priv->vscrollbar_visible)
-    indicator_start_fade (&priv->vindicator, 1.0);
+  /* Only flash the indicators in on genuine pointer movement, not on the
+   * synthetic relayout motion tracked above (issue #16). */
+  if (moved)
+    {
+      if (priv->hscrollbar_visible)
+        indicator_start_fade (&priv->hindicator, 1.0);
+      if (priv->vscrollbar_visible)
+        indicator_start_fade (&priv->vindicator, 1.0);
+    }
 
   if ((target == priv->child ||
        gtk_widget_is_ancestor (target, priv->child)) &&
@@ -2212,8 +2224,10 @@ gtk_scrolled_window_init (GtkScrolledWindow *scrolled_window)
   gtk_css_node_set_state (priv->junction_node, gtk_css_node_get_state (widget_node));
   g_object_unref (priv->junction_node);
 
-  controller = gtk_event_controller_scroll_new (GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES |
-                                                GTK_EVENT_CONTROLLER_SCROLL_KINETIC);
+  /* Broadway fork: no kinetic fling from scroll events - it animates many frames
+   * a remote framebuffer renders choppily, and the browser already drives the
+   * deltas. Touch fling (swipe_gesture) is a separate path, unaffected. */
+  controller = gtk_event_controller_scroll_new (GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
   g_signal_connect (controller, "scroll-begin",
                     G_CALLBACK (scroll_controller_scroll_begin), scrolled_window);
   g_signal_connect (controller, "scroll",
@@ -2222,8 +2236,7 @@ gtk_scrolled_window_init (GtkScrolledWindow *scrolled_window)
                     G_CALLBACK (scroll_controller_scroll_end), scrolled_window);
   gtk_widget_add_controller (widget, controller);
 
-  controller = gtk_event_controller_scroll_new (GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES |
-                                                GTK_EVENT_CONTROLLER_SCROLL_KINETIC);
+  controller = gtk_event_controller_scroll_new (GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
   gtk_event_controller_set_propagation_phase (controller, GTK_PHASE_CAPTURE);
   g_signal_connect (controller, "scroll-begin",
                     G_CALLBACK (stop_kinetic_scrolling_cb), scrolled_window);

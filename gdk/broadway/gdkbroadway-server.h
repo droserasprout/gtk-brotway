@@ -42,7 +42,8 @@ guint32            _gdk_broadway_server_new_surface               (GdkBroadwaySe
 								  int                 x,
 								  int                 y,
 								  int                 width,
-								  int                 height);
+								  int                 height,
+								  gboolean            is_popup);
 void               _gdk_broadway_server_destroy_surface           (GdkBroadwayServer  *server,
 								  int                 id);
 gboolean           _gdk_broadway_server_surface_show              (GdkBroadwayServer  *server,
@@ -56,6 +57,18 @@ void               _gdk_broadway_server_surface_set_transient_for (GdkBroadwaySe
 								  int                 parent);
 void               _gdk_broadway_server_set_show_keyboard        (GdkBroadwayServer  *server,
 								  gboolean            show_keyboard);
+void               _gdk_broadway_server_open_uri                 (GdkBroadwayServer  *server,
+								  const char         *uri);
+void               _gdk_broadway_server_surface_set_cursor        (GdkBroadwayServer  *server,
+								  int                 id,
+								  const char         *name);
+void               _gdk_broadway_server_surface_set_title         (GdkBroadwayServer  *server,
+								  int                 id,
+								  const char         *title);
+void               _gdk_broadway_server_surface_set_icon          (GdkBroadwayServer  *server,
+								  int                 id,
+								  const guchar       *data,
+								  gsize               len);
 guint32             gdk_broadway_server_upload_texture           (GdkBroadwayServer  *server,
                                                                   GdkTexture         *texture);
 void                gdk_broadway_server_release_texture          (GdkBroadwayServer  *server,
@@ -73,3 +86,13 @@ gboolean           _gdk_broadway_server_surface_move_resize       (GdkBroadwaySe
 void               _gdk_broadway_server_surface_set_modal_hint   (GdkBroadwayServer *server,
                                                                   int                id,
                                                                   gboolean           modal_hint);
+void               _gdk_broadway_server_surface_set_keep_above   (GdkBroadwayServer *server,
+                                                                  int                id,
+                                                                  gboolean           keep_above);
+void               _gdk_broadway_server_surface_set_input_region (GdkBroadwayServer *server,
+                                                                  int                id,
+                                                                  int                mode,
+                                                                  int                x,
+                                                                  int                y,
+                                                                  int                width,
+                                                                  int                height);

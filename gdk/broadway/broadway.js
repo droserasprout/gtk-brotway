@@ -38,6 +38,35 @@ const BROADWAY_OP_UPLOAD_TEXTURE = 13;
 const BROADWAY_OP_RELEASE_TEXTURE = 14;
 const BROADWAY_OP_SET_NODES = 15;
 const BROADWAY_OP_ROUNDTRIP = 16;
+const BROADWAY_OP_SET_CLIPBOARD = 17;
+const BROADWAY_OP_REQUEST_CLIPBOARD = 18;
+const BROADWAY_OP_SET_INPUT_REGION = 19;
+const BROADWAY_OP_REASSERT_POINTER = 20;
+const BROADWAY_OP_OPEN_URI = 21;
+const BROADWAY_OP_SESSION = 22;
+const BROADWAY_OP_PONG = 23;
+const BROADWAY_OP_DEBUG_FLASH = 24;
+const BROADWAY_OP_DEBUG_SET_SCREEN = 25;
+const BROADWAY_OP_SET_CURSOR = 26;
+const BROADWAY_OP_SET_TITLE = 27;
+const BROADWAY_OP_SET_ICON = 28;
+const BROADWAY_OP_SET_MODAL = 29;
+
+/* CSS cursor keywords GTK can ask for via gdk_cursor_get_name. An unknown name
+ * is dropped to "default" so the browser never silently keeps a stale cursor. */
+const CSS_CURSOR_NAMES = new Set([
+    "default", "none", "context-menu", "help", "pointer", "progress", "wait",
+    "cell", "crosshair", "text", "vertical-text", "alias", "copy", "move",
+    "no-drop", "not-allowed", "grab", "grabbing", "all-scroll", "col-resize",
+    "row-resize", "n-resize", "e-resize", "s-resize", "w-resize", "ne-resize",
+    "nw-resize", "se-resize", "sw-resize", "ew-resize", "ns-resize",
+    "nesw-resize", "nwse-resize", "zoom-in", "zoom-out"
+]);
+
+/* Latin 'v'/'V' keysyms, used to recognise the paste shortcut (Ctrl+V and
+ * Ctrl+Shift+V) so the browser's native 'paste' event is allowed to fire. */
+const KEYSYM_v = 118;
+const KEYSYM_V = 86;
 
 const BROADWAY_EVENT_ENTER = 0;
 const BROADWAY_EVENT_LEAVE = 1;
@@ -54,6 +83,21 @@ const BROADWAY_EVENT_CONFIGURE_NOTIFY = 11;
 const BROADWAY_EVENT_SCREEN_SIZE_CHANGED = 12;
 const BROADWAY_EVENT_FOCUS = 13;
 const BROADWAY_EVENT_ROUNDTRIP_NOTIFY = 14;
+const BROADWAY_EVENT_CLIPBOARD_CONTENTS = 15;
+const BROADWAY_EVENT_PING = 16;
+/* Browser->daemon "summon the debug menu". The daemon intercepts it (like
+ * CLIPBOARD_CONTENTS) and never forwards it to GTK clients. */
+const BROADWAY_EVENT_MENU = 17;
+/* Browser->daemon visibility hints. The daemon forwards them to GTK, which
+ * freezes (SUSPEND) / thaws (RESUME) rendering so a backgrounded tab costs no
+ * frames; the open socket lets RESUME repaint just the delta (no reconnect). */
+const BROADWAY_EVENT_SUSPEND = 18;
+const BROADWAY_EVENT_RESUME = 19;
+/* Browser->daemon prefers-color-scheme (0 no-pref, 1 dark, 2 light). The daemon
+ * intercepts it and reports it via org.freedesktop.portal.Settings so libadwaita
+ * follows the browser theme; never forwarded to GTK as an input event. */
+const BROADWAY_EVENT_COLOR_SCHEME = 21;
+const BROADWAY_EVENT_REDUCED_MOTION = 22;
 
 const DISPLAY_OP_REPLACE_CHILD = 0;
 const DISPLAY_OP_APPEND_CHILD = 1;
@@ -93,11 +137,20 @@ var useDataUrls = window.location.search.includes("datauri");
 
 /* check if we are on Android and using Chrome */
 var isAndroidChrome = false;
+/* Gecko (Firefox) does native Ctrl+wheel page-zoom (innerWidth/dpr change ->
+ * resize -> GTK reflows); Blink/WebKit only visual-viewport pinch, which never
+ * reflows, so we drive zoom ourselves there (#55). Detect the engine by a
+ * feature (mozInnerScreenX, -moz-appearance), not the UA string - a UA override
+ * could otherwise misroute Firefox onto the manual path. */
+var isGecko = false;
 {
     var ua = navigator.userAgent.toLowerCase();
     if (ua.indexOf("android") > -1 && ua.indexOf("chrom") > -1) {
 	isAndroidChrome = true;
     }
+    isGecko = ("mozInnerScreenX" in window) ||
+              (!!window.CSS && !!window.CSS.supports && window.CSS.supports("-moz-appearance", "none")) ||
+              (ua.indexOf("firefox") > -1);
 }
 /* check for the passive option for Event listener */
 let passiveSupported = false;
@@ -260,10 +313,21 @@ function touchIdentifier(tId)
     return tId;
 }
 
-var grab = new Object();
-grab.surface = null;
-grab.ownerEvents = false;
-grab.implicit = false;
+/* Pointer grabs stack (mirrors the daemon) so a popup chain nests: GRAB pushes,
+ * UNGRAB pops to the parent. `grab` caches the top for the read-sites. Invariant:
+ * explicit grabs (from daemon ops) stay LIFO-synced with the daemon's stack; an
+ * implicit grab (button press) is browser-local - the daemon never sees it -
+ * taken only when the stack is empty, so it's at most one entry, always at the
+ * bottom. onMouseUp must therefore splice it, not pop, when an explicit grab
+ * nested over it. */
+var grabStack = [];
+var grab = { surface: null, ownerEvents: false, implicit: false };
+function updateGrabCache() {
+    if (grabStack.length > 0)
+        grab = grabStack[grabStack.length - 1];
+    else
+        grab = { surface: null, ownerEvents: false, implicit: false };
+}
 var keyDownList = [];
 var inputList = [];
 var lastSerial = 0;
@@ -281,9 +345,205 @@ var outstandingDisplayCommands = null;
 var inputSocket = null;
 var debugDecoding = false;
 var fakeInput = null;
+
+/* Auto-reconnect + session liveness (see the block above connect()). */
+var ws = null;
+var sessionToken = null;       /* daemon id from BROADWAY_OP_SESSION; null until first seen */
+var clientId = 0;              /* server-assigned id; sent back as ?cid= on reconnect */
+var sessionInvalidated = false;/* true => give up, show disconnected until manual refresh */
+var reconnecting = false;      /* true while the dim+spinner overlay is up */
+var tabSuspended = false;       /* true while we've told GTK to freeze rendering (tab hidden) */
+var suspendTimer = null;       /* debounce hidden->SUSPEND so an unloading tab never freezes */
+var pageUnloading = false;     /* set on pagehide/beforeunload: never SUSPEND while leaving */
+var SUSPEND_DEBOUNCE_MS = 400; /* a reload/close tears the page down well within this */
+var reconnectTimer = null;
+var reconnectDelay = 0;        /* backoff in ms */
+var awaitFirstFrame = false;   /* drop the overlay once the resync repaints */
+var resumeSafetyTimer = null;  /* fallback to drop the overlay if no frame arrives */
+var overlayEl = null;
+
+/* Heartbeat: catches a half-open socket that never fires onclose (wi-fi off on
+ * a foreground tab, cellular handover). Any inbound message counts as a PONG. */
+var HEARTBEAT_MS = 2500;
+var HEARTBEAT_TIMEOUT_MS = 7000;
+/* The post-(re)connect resync arrives as one giant ws frame (all textures +
+ * node trees); onmessage only fires on the COMPLETE frame and the daemon is
+ * blocked writing it, so it can't pong. Give a fresh socket much longer to
+ * deliver its first message before declaring the link dead. */
+var FIRST_MESSAGE_TIMEOUT_MS = 60000;
+var awaitingFirstMessage = false;
+var heartbeatTimer = null;
+var lastPongTime = 0;
+var pingSentTime = 0;          /* when the last PING went out, for RTT measurement */
+var lastRtt = 0;               /* last measured round-trip (ms), reported to the daemon */
+var paintFlashing = false;     /* debug overlay: received (magenta), reused (green), uploaded (red) */
+var pinnedScreen = null;       /* debug: {w,h,s} forces logical screen size/scale, overriding window/dpr */
+const FLASH_MS = 100;          /* how long a flash stays up (no fade) */
+var textureBatch = 0;          /* bumped per message; a Texture's batch == this => uploaded now */
+var flashPool = [];            /* recycled paint-flash overlay divs (avoids per-node create/remove churn) */
+const FLASH_MAX = 200;         /* cap overlays drawn per frame to keep layout cost bounded */
+/* Clipboard paste capture: a hidden, focused textarea receives the browser's
+ * native 'paste' event (Ctrl+V). Unlike navigator.clipboard.readText(), that
+ * event needs no permission/user-activation popup, so we cache the pasted text
+ * and answer the GTK app's clipboard request from it. */
+var clipboardArea = null;
+var pasteCache = "";
+var pasteCacheTime = 0;
+/* A 'keyPress' (or 'paste', or 'compositionend') and the trailing 'beforeinput'
+ * the browser fires to mirror it are dispatched in the *same* event-loop turn,
+ * so a small wall-clock window cleanly separates "this beforeinput just echoes
+ * something we already forwarded" from "this is a genuinely new character". The
+ * window only has to outlast that single turn; it stays far below the gap
+ * between two real keystrokes, so it never swallows distinct input. The
+ * keyPress/composition cases additionally match on the text itself (below), so
+ * the window can at worst double a repeated char, never drop a different one. */
+const INPUT_ECHO_WINDOW_MS = 50;
+/* Dedupes a 'paste' against its trailing 'beforeinput' on touch. */
+var lastPasteForwardTime = 0;
+/* The text + time of the last real keyPress, to dedupe the trailing 'beforeinput'
+ * on the touch OSK input (Latin keys fire both; IME/non-Latin only beforeinput). */
+var lastKeyPressTime = 0;
+var lastKeyPressText = "";
+/* True while an IME composition is in progress on the touch OSK input. */
+var imeComposing = false;
+/* The text + time of the last compositionend, to dedupe a trailing 'insertText'
+ * beforeinput that some browsers fire after the composition already committed. */
+var lastCompositionEndTime = 0;
+var lastCompositionText = "";
 var showKeyboard = false;
 var showKeyboardChanged = false;
-var firstTouchDownId = null;
+var firstTouchDownId = null;     /* mapped id (touchIdentifier), as sent on the wire */
+var firstTouchDownRawId = null;  /* browser identifier, keys activeTouches/touchSurfaceIds */
+/* Surface id per active touch, captured at touchstart. A drag keeps routing to
+ * the right surface even after GTK repaints and detaches the node it began on. */
+var touchSurfaceIds = {};
+
+/* Touch pinch-zoom. Mirrors desktop browser page-zoom: a two-finger pinch sets
+ * zoomFactor, which (a) scales down the size we report to GTK and bumps the
+ * reported scale (sendScreenSizeChanged) so GTK re-lays-out crisply, and (b)
+ * magnifies the surface wrapper (#zoomRoot) by the same factor so it fills the
+ * viewport. Page coords map to surface root coords by a plain divide-by-zoom
+ * (getPositionsFromEvent), since the wrapper's transform-origin is 0 0. */
+var ZOOM_MIN = 0.25;
+var ZOOM_MAX = 5.0;
+/* Ctrl+wheel zoom step: zoomFactor *= exp(-deltaY * this) - a wheel notch and a
+ * trackpad pinch both scale proportionally. */
+var ZOOM_WHEEL_SENS = 0.001;
+/* A wheel-zoom "burst" mirrors a touch pinch: a cursor-anchored CSS preview
+ * while notches arrive, then the crisp reflow on settle. wheelFocus is the
+ * pivot; wheelStartZoom is the committed zoom (plain scale) at burst start. */
+var wheelBurstActive = false;
+var wheelStartZoom = 1.0;
+var wheelFocusX = 0;
+var wheelFocusY = 0;
+var wheelSettleTimer = null;
+var zoomFactor = 1.0;       /* committed zoom; drives reported size + remap */
+var zoomRoot = null;        /* the #zoomRoot wrapper element (or document.body) */
+/* Live pinch state. activeTouches tracks every finger by identifier so we can
+ * measure the pinch distance; suppressTouchForward stays true from pinch-begin
+ * until ALL fingers lift, so a leftover finger never becomes a stray GTK tap. */
+var activeTouches = {};
+var pinchActive = false;
+var pinchStartDist = 0;
+var pinchStartZoom = 1.0;
+var pinchStartMid = { x: 0, y: 0 };
+var suppressTouchForward = false;
+
+function clampZoom(z) {
+    if (z < ZOOM_MIN) return ZOOM_MIN;
+    if (z > ZOOM_MAX) return ZOOM_MAX;
+    return z;
+}
+
+function touchPointDistance(a, b) {
+    var dx = a.x - b.x, dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+/* The two-point distance of the currently active fingers (first two by id). */
+function activeTouchDistance() {
+    var pts = [];
+    for (var k in activeTouches) {
+        pts.push(activeTouches[k]);
+        if (pts.length == 2)
+            break;
+    }
+    if (pts.length < 2)
+        return 0;
+    return touchPointDistance(pts[0], pts[1]);
+}
+
+function activeTouchCount() {
+    return Object.keys(activeTouches).length;
+}
+
+/* Midpoint (page coords) of the first two active fingers. */
+function activeTouchMidpoint() {
+    var pts = [];
+    for (var k in activeTouches) {
+        pts.push(activeTouches[k]);
+        if (pts.length == 2)
+            break;
+    }
+    if (pts.length == 0)
+        return { x: 0, y: 0 };
+    if (pts.length == 1)
+        return { x: pts[0].x, y: pts[0].y };
+    return { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+}
+
+/* Magnify the surface wrapper. At z == 1 leave transform unset so the desktop
+ * path is untouched (no extra compositing layer / text reblur). */
+function applyZoomTransform(z) {
+    if (zoomRoot == null)
+        return;
+    zoomRoot.style.transform = (z == 1.0) ? "" : ("scale(" + z + ")");
+}
+
+/* Live pinch preview: scale around the pinch midpoint and let it follow the
+ * fingers, so the magnified view floats with them (Apple-like) instead of
+ * anchoring to the top-left corner. We pin the layout point that was under the
+ * start midpoint to the current midpoint: page = translate(t) + zoom * layout,
+ * with layout_focus = pinchStartMid / pinchStartZoom (the pre-pinch transform
+ * was scale(pinchStartZoom) at origin 0 0). On commit endPinch resets to a plain
+ * scale (no translate) as the crisp reflow fills the viewport. */
+function applyPinchPreview() {
+    if (zoomRoot == null)
+        return;
+    var mid = activeTouchMidpoint();
+    var tx = mid.x - zoomFactor * (pinchStartMid.x / pinchStartZoom);
+    var ty = mid.y - zoomFactor * (pinchStartMid.y / pinchStartZoom);
+    zoomRoot.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + zoomFactor + ")";
+}
+
+/* Live wheel preview: applyPinchPreview's focal-anchor math, pivoting on the
+ * fixed cursor (wheelFocus). Keeps the point under the cursor put as zoom grows,
+ * so the view grows from the cursor, not the top-left corner. */
+function applyWheelPreview() {
+    if (zoomRoot == null)
+        return;
+    var tx = wheelFocusX - zoomFactor * (wheelFocusX / wheelStartZoom);
+    var ty = wheelFocusY - zoomFactor * (wheelFocusY / wheelStartZoom);
+    zoomRoot.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + zoomFactor + ")";
+}
+
+/* Persist the committed zoom (per origin) so a page refresh (common on mobile)
+ * keeps it instead of snapping back to 1. localStorage may be unavailable
+ * (private mode / disabled), so guard. */
+var ZOOM_STORAGE_KEY = "broadwayZoom";
+
+function saveZoom() {
+    try { window.localStorage.setItem(ZOOM_STORAGE_KEY, String(zoomFactor)); }
+    catch (e) { }
+}
+
+function loadSavedZoom() {
+    try {
+        var v = parseFloat(window.localStorage.getItem(ZOOM_STORAGE_KEY));
+        if (!isNaN(v))
+            zoomFactor = clampZoom(v);
+    } catch (e) { }
+}
 
 function getButtonMask (button) {
     if (button == 1)
@@ -311,6 +571,7 @@ function Texture(id, data) {
     this.url = url;
     this.refcount = 1;
     this.id = id;
+    this.batch = textureBatch;  /* which message uploaded these pixels (for paint-flash) */
 
     var image = new Image();
     image.src = this.url;
@@ -343,6 +604,7 @@ function cmdCreateSurface(id, x, y, width, height)
 {
     var surface = { id: id, x: x, y:y, width: width, height: height };
     surface.transientParent = 0;
+    surface.modal = false;
     surface.visible = false;
     surface.imageData = null;
     surface.nodes = {};
@@ -367,10 +629,137 @@ function cmdCreateSurface(id, x, y, width, height)
     return div;
 }
 
+var modalScrim = null;
+
+/* A full-screen dim + input-blocking layer placed just below the topmost
+ * visible modal surface. broadwayd tracks modal_hint but doesn't enforce
+ * modality (the GTK app blocks button events, but motion/hover still leaks to
+ * the parent and there's no dim). The scrim dims the blocked surfaces and
+ * swallows all pointer/touch input so it never reaches them - the same backdrop
+ * a real compositor draws for a modal. It lives in the surfaces' stacking
+ * context (the zoom wrapper) so z-index interleaves with them. */
+function ensureModalScrim() {
+    if (modalScrim)
+        return modalScrim;
+    var d = document.createElement("div");
+    /* Oversized so it covers every blocked surface wherever it sits; the
+     * viewport clips the overdraw. Colour matches libadwaita's dark dialog/sheet
+     * backdrop (shade-color rgb(0 0 6 / 25%) doubled). Light mode would be
+     * rgb(0 0 6 / 14%), but the client has no theme signal; the WebUI defaults
+     * to dark. */
+    d.style.cssText = "position:absolute;left:-10000px;top:-10000px;width:30000px;height:30000px;background:rgba(0,0,6,0.5);display:none;";
+    /* The broadway input handlers live on document; stop events here so a click
+     * on the dim can't reach (or refocus away from the modal to) a blocked
+     * surface. Exception: while a pointer/touch gesture is mid-flight (dragging
+     * the modal's titlebar past its own edge lands the cursor on the scrim),
+     * let the events bubble to the document handlers - they route to the grabbed
+     * surface, so the drag keeps tracking and its release still ends the grab.
+     * Swallowing them would freeze the drag and, eating the button-up/touch-end,
+     * strand GTK's move grab. A fresh press/tap on the dim (no gesture active) is
+     * still swallowed, so blocked surfaces stay inert. */
+    var swallow = function (ev) {
+        if (grab.surface != null || firstTouchDownId != null)
+            return;
+        ev.preventDefault();
+        ev.stopPropagation();
+    };
+    ["mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "click",
+     "dblclick", "contextmenu", "wheel", "touchstart", "touchmove", "touchend",
+     "touchcancel"].forEach(function (t) {
+        d.addEventListener(t, swallow, { passive: false });
+    });
+    (zoomRoot || document.body).appendChild(d);
+    modalScrim = d;
+    return d;
+}
+
 function restackSurfaces() {
+    /* Topmost visible modal blocks everything stacked below it. */
+    var modalIdx = -1;
+    for (var i = stackingOrder.length - 1; i >= 0; i--) {
+        if (stackingOrder[i].modal && stackingOrder[i].visible) {
+            modalIdx = i;
+            break;
+        }
+    }
+
+    var z = 0;
     for (var i = 0; i < stackingOrder.length; i++) {
-        var surface = stackingOrder[i];
-        surface.div.style.zIndex = i;
+        if (i == modalIdx) {
+            var scrim = ensureModalScrim();
+            scrim.style.zIndex = z++;
+            scrim.style.display = "block";
+        }
+        stackingOrder[i].div.style.zIndex = z++;
+    }
+
+    if (modalIdx == -1 && modalScrim)
+        modalScrim.style.display = "none";
+}
+
+/* Tab title + favicon follow the topmost real toplevel (no transient parent),
+ * so dialogs/menus/popovers don't hijack the tab. The last applied pair is kept
+ * in sessionStorage and restored synchronously by client.html on load, so a page
+ * reload doesn't blink the default title/icon before the session reconnects.
+ * Seed the "applied" markers from storage so the resync doesn't redundantly
+ * rewrite an unchanged title/icon. */
+var tabFaviconLink = null;
+var tabTitleApplied = null;
+var tabIconApplied = null;
+try {
+    tabTitleApplied = sessionStorage.getItem("brotwayTabTitle");
+    tabIconApplied = sessionStorage.getItem("brotwayTabIcon");
+} catch (e) {}
+
+/* PNG bytes -> data: URL. Used for the favicon (not blob:) so it can be stored
+ * and restored across a reload; blob: URLs are invalid after navigation. */
+function pngBytesToDataUrl(bytes) {
+    var s = "";
+    for (var i = 0; i < bytes.length; i++)
+        s += String.fromCharCode(bytes[i]);
+    return "data:image/png;base64," + btoa(s);
+}
+
+function ensureFaviconLink() {
+    if (tabFaviconLink && tabFaviconLink.parentNode)
+        return tabFaviconLink;
+    var link = document.querySelector("link[rel~='icon']");
+    if (!link) {
+        link = document.createElement("link");
+        link.rel = "icon";
+        document.head.appendChild(link);
+    }
+    tabFaviconLink = link;
+    return link;
+}
+
+function pickPrimarySurface() {
+    for (var i = stackingOrder.length - 1; i >= 0; i--) {
+        var s = stackingOrder[i];
+        if (s.transientParent == 0 && s.visible)
+            return s;
+    }
+    return null;
+}
+
+function updateTabIdentity() {
+    var s = pickPrimarySurface();
+    if (!s)
+        return;
+
+    if (s.title != undefined && s.title !== tabTitleApplied) {
+        document.title = s.title;
+        tabTitleApplied = s.title;
+        try { sessionStorage.setItem("brotwayTabTitle", s.title); } catch (e) {}
+    }
+
+    if (s.iconUrl !== undefined && s.iconUrl !== tabIconApplied) {
+        ensureFaviconLink().href = s.iconUrl ? s.iconUrl : "";
+        tabIconApplied = s.iconUrl;
+        try {
+            if (s.iconUrl) sessionStorage.setItem("brotwayTabIcon", s.iconUrl);
+            else sessionStorage.removeItem("brotwayTabIcon");
+        } catch (e) {}
     }
 }
 
@@ -638,6 +1027,9 @@ TransformNodes.prototype.insertNode = function(parent, previousSibling, is_tople
         case BROADWAY_NODE_REUSE:
         {
             oldNode = this.nodes[id];
+            /* Reused content node (kept/re-parented, not redrawn) -> "reused" colour. */
+            if (oldNode && oldNode.__content)
+                oldNode.__flashKind = 2;
         }
         break;
         /* Leaf nodes */
@@ -651,10 +1043,25 @@ TransformNodes.prototype.insertNode = function(parent, previousSibling, is_tople
             image.height = rect.height;
             image.style["position"] = "absolute";
             set_rect_style(image, rect);
-            var texture = textures[texture_id].ref();
-            image.src = texture.url;
-            // Unref blob url when loaded
-            image.onload = function() { texture.unref(); };
+            /* A texture id can be stale if it was released before this node is
+             * processed (a lifecycle race; the daemon then remaps it to 0). Skip
+             * gracefully - throwing here would wedge the whole render loop until a
+             * page refresh. Mirrors the unknown-node handling in execute(). */
+            var texture = textures[texture_id];
+            if (texture) {
+                texture.ref();
+                image.src = texture.url;
+                // Unref blob url when loaded (or if the decode fails, so the
+                // ref + blob url can't leak on a never-loading image).
+                image.onload = function() { texture.unref(); };
+                image.onerror = image.onload;
+                image.__content = true;  /* drawn pixels */
+                /* 3 = texture uploaded this batch (real traffic), 1 = node re-sent but
+                 * the texture was cached (cheap). */
+                image.__flashKind = (texture.batch === textureBatch) ? 3 : 1;
+            } else {
+                console.warn("broadway: NODE_TEXTURE references unknown texture " + texture_id);
+            }
             newNode = image;
         }
         break;
@@ -667,6 +1074,8 @@ TransformNodes.prototype.insertNode = function(parent, previousSibling, is_tople
             div.style["position"] = "absolute";
             set_rect_style(div, rect);
             div.style["background-color"] = c;
+            div.__content = true;
+            div.__flashKind = 1;
             newNode = div;
         }
         break;
@@ -683,18 +1092,64 @@ TransformNodes.prototype.insertNode = function(parent, previousSibling, is_tople
 
             var div = this.createDiv(id);
             div.style["position"] = "absolute";
-            rrect.bounds.width -= border_widths[1] + border_widths[3];
-            rrect.bounds.height -= border_widths[0] + border_widths[2];
-            set_rrect_style(div, rrect);
-            div.style["border-style"] = "solid";
-            div.style["border-top-color"] = border_colors[0];
-            div.style["border-top-width"] = px(border_widths[0]);
-            div.style["border-right-color"] = border_colors[1];
-            div.style["border-right-width"] = px(border_widths[1]);
-            div.style["border-bottom-color"] = border_colors[2];
-            div.style["border-bottom-width"] = px(border_widths[2]);
-            div.style["border-left-color"] = border_colors[3];
-            div.style["border-left-width"] = px(border_widths[3]);
+
+            /* Draw a border as inset box-shadow(s) on one element, like the
+             * window frame's 1px border. A CSS border is a separate element
+             * whose edge meets the background's, which the browser rasterizes
+             * with a 1px seam (and a corner sliver) at any zoom. Uniform border:
+             * coincide this div with the background sibling (border box for
+             * buttons, 1px smaller for menus) and use one inset shadow. */
+            if (border_widths[0] === border_widths[1] &&
+                border_widths[1] === border_widths[2] &&
+                border_widths[2] === border_widths[3] &&
+                border_colors[0] === border_colors[1] &&
+                border_colors[1] === border_colors[2] &&
+                border_colors[2] === border_colors[3]) {
+                var bg = previousSibling;
+                var snapped = false;
+                /* Size must agree too - an unrelated sibling (parent background,
+                 * separator) whose origin happens to fall within tolerance must
+                 * not donate its geometry to the border. */
+                if (bg && bg.tagName === "DIV" && bg.style.width &&
+                    Math.abs(parseFloat(bg.style.left) - rrect.bounds.x) <= border_widths[0] + 1 &&
+                    Math.abs(parseFloat(bg.style.top) - rrect.bounds.y) <= border_widths[0] + 1 &&
+                    Math.abs(parseFloat(bg.style.width) - rrect.bounds.width) <= border_widths[0] + 1 &&
+                    Math.abs(parseFloat(bg.style.height) - rrect.bounds.height) <= border_widths[0] + 1) {
+                    div.style["left"] = bg.style.left;
+                    div.style["top"] = bg.style.top;
+                    div.style["width"] = bg.style.width;
+                    div.style["height"] = bg.style.height;
+                    div.style["border-top-left-radius"] = bg.style.borderTopLeftRadius;
+                    div.style["border-top-right-radius"] = bg.style.borderTopRightRadius;
+                    div.style["border-bottom-right-radius"] = bg.style.borderBottomRightRadius;
+                    div.style["border-bottom-left-radius"] = bg.style.borderBottomLeftRadius;
+                    snapped = true;
+                } else {
+                    set_rrect_style(div, rrect);
+                }
+                /* Inset when the border box coincides with the bg (buttons). For a
+                 * menu the bg is the content-box, 1px inside the border-box, so an
+                 * inset paints the border into the body and leaves the border-box
+                 * ring transparent (the window shows through as a stray frame). When
+                 * the outline is larger than the snapped bg, spread the border
+                 * outward to fill that ring; corners match (bg radius + spread =
+                 * border-box radius). */
+                var outset = snapped &&
+                    (rrect.bounds.width > parseFloat(div.style.width) + 0.5 ||
+                     rrect.bounds.height > parseFloat(div.style.height) + 0.5);
+                div.style["box-shadow"] =
+                    (outset ? "" : "inset ") +
+                    "0 0 0 " + px(border_widths[0]) + " " + border_colors[0];
+            } else {
+                /* Per-side border (an active button's darker top edge): one
+                 * directional inset shadow per side, same single-element trick. */
+                set_rrect_style(div, rrect);
+                div.style["box-shadow"] =
+                    "inset 0 " + px(border_widths[0]) + " 0 0 " + border_colors[0] + ", " +
+                    "inset " + px(-border_widths[1]) + " 0 0 0 " + border_colors[1] + ", " +
+                    "inset 0 " + px(-border_widths[2]) + " 0 0 " + border_colors[2] + ", " +
+                    "inset " + px(border_widths[3]) + " 0 0 0 " + border_colors[3];
+            }
             newNode = div;
         }
         break;
@@ -927,8 +1382,8 @@ TransformNodes.prototype.execute = function(display_commands)
             delete this.nodes[removeId];
             if (remove == null)
                 console.log("Wanted to delete node " + removeId + " but it is unknown");
-
-            this.display_commands.push([DISPLAY_OP_DELETE_NODE, remove]);
+            else
+                this.display_commands.push([DISPLAY_OP_DELETE_NODE, remove]);
             break;
         case BROADWAY_NODE_OP_MOVE_AFTER_CHILD:
             parentId = this.decode_uint32();
@@ -948,8 +1403,17 @@ TransformNodes.prototype.execute = function(display_commands)
             var textureNodeId = this.decode_uint32();
             var textureNode = this.nodes[textureNodeId];
             var textureId = this.decode_uint32();
-            var texture = textures[textureId].ref();
-            this.display_commands.push([DISPLAY_OP_CHANGE_TEXTURE, textureNode, texture]);
+            var texture = textures[textureId];
+            if (!texture) {
+                console.warn("broadway: PATCH_TEXTURE references unknown texture " + textureId);
+            } else if (!textureNode) {
+                /* Don't ref for a node we can't patch - the display phase skips
+                 * the command and the decode ref would leak the texture forever. */
+                console.warn("broadway: PATCH_TEXTURE references unknown node " + textureNodeId);
+            } else {
+                texture.ref();
+                this.display_commands.push([DISPLAY_OP_CHANGE_TEXTURE, textureNode, texture]);
+            }
             break;
         case BROADWAY_NODE_OP_PATCH_TRANSFORM:
             var transformNodeId = this.decode_uint32();
@@ -975,57 +1439,101 @@ function cmdUngrabPointer()
         doUngrab();
 }
 
+/* A pooled paint-flash overlay div. Created once and kept in document.body
+ * forever (just toggled display:none); recycled via flashPool so heavy frames
+ * don't churn the DOM. */
+function getFlashDiv() {
+    var f = flashPool.pop();
+    if (!f) {
+        f = document.createElement("div");
+        f.style.cssText = "position:fixed;pointer-events:none;z-index:2147483647;";
+        document.body.appendChild(f);
+    }
+    return f;
+}
+
 function handleDisplayCommands(display_commands)
 {
+    /* A double-scheduled requestAnimationFrame can fire after a prior frame
+     * already applied and cleared outstandingDisplayCommands, so the arg is
+     * null - nothing left to apply. */
+    if (!display_commands)
+        return;
     var div, parent;
+    var flashed = paintFlashing ? [] : null;
     var len = display_commands.length;
     for (var i = 0; i < len; i++) {
         var cmd = display_commands[i];
 
+        /* A node/texture id can be stale (a lifecycle race during heavy scroll
+         * leaves the renderer referencing a node the browser no longer has).
+         * Guard each deref and keep a per-command try/catch backstop so one bad
+         * command degrades gracefully instead of wedging the render loop until a
+         * page refresh. */
+        try {
         switch (cmd[0]) {
         case DISPLAY_OP_REPLACE_CHILD:
-            cmd[1].replaceChild(cmd[2], cmd[3]);
+            if (cmd[1] && cmd[2] && cmd[3]) {
+                cmd[1].replaceChild(cmd[2], cmd[3]);
+                if (flashed && cmd[2].__flashKind) flashed.push(cmd[2]);
+            }
             break;
         case DISPLAY_OP_APPEND_CHILD:
-            cmd[1].appendChild(cmd[2]);
+            if (cmd[1] && cmd[2]) {
+                cmd[1].appendChild(cmd[2]);
+                if (flashed && cmd[2].__flashKind) flashed.push(cmd[2]);
+            }
             break;
         case DISPLAY_OP_INSERT_AFTER_CHILD:
             parent = cmd[1];
             var afterThis = cmd[2];
             div = cmd[3];
-            if (afterThis == null) // First
-                parent.insertBefore(div, parent.firstChild);
-            else
-                parent.insertBefore(div, afterThis.nextSibling);
+            if (parent && div) {
+                if (afterThis == null) // First
+                    parent.insertBefore(div, parent.firstChild);
+                else
+                    parent.insertBefore(div, afterThis.nextSibling);
+                if (flashed && div.__flashKind) flashed.push(div);
+            }
             break;
         case DISPLAY_OP_APPEND_ROOT:
-            document.body.appendChild(cmd[1]);
+            /* Into the zoom wrapper, not document.body, so the pinch-zoom
+             * transform magnifies all surfaces (the offscreen clipboard/OSK
+             * helpers stay on document.body and unscaled). */
+            if (cmd[1])
+                (zoomRoot || document.body).appendChild(cmd[1]);
             break;
         case DISPLAY_OP_SHOW_SURFACE:
             div = cmd[1];
-            var xOffset = cmd[2];
-            var yOffset = cmd[3];
-            div.style["left"] = xOffset + "px";
-            div.style["top"] = yOffset + "px";
-            div.style["visibility"] = "visible";
+            if (div) {
+                div.style["left"] = cmd[2] + "px";
+                div.style["top"] = cmd[3] + "px";
+                div.style["visibility"] = "visible";
+            }
             break;
         case DISPLAY_OP_HIDE_SURFACE:
             div = cmd[1];
-            div.style["visibility"] = "hidden";
+            if (div)
+                div.style["visibility"] = "hidden";
             break;
         case DISPLAY_OP_DELETE_NODE:
             div = cmd[1];
-            div.parentNode.removeChild(div);
+            if (div && div.parentNode)
+                div.parentNode.removeChild(div);
             break;
         case DISPLAY_OP_MOVE_NODE:
             div = cmd[1];
-            div.style["left"] = cmd[2] + "px";
-            div.style["top"] = cmd[3] + "px";
+            if (div) {
+                div.style["left"] = cmd[2] + "px";
+                div.style["top"] = cmd[3] + "px";
+            }
             break;
         case DISPLAY_OP_RESIZE_NODE:
             div = cmd[1];
-            div.style["width"] = cmd[2] + "px";
-            div.style["height"] = cmd[3] + "px";
+            if (div) {
+                div.style["width"] = cmd[2] + "px";
+                div.style["height"] = cmd[3] + "px";
+            }
             break;
 
         case DISPLAY_OP_RESTACK_SURFACES:
@@ -1033,34 +1541,99 @@ function handleDisplayCommands(display_commands)
             break;
         case DISPLAY_OP_DELETE_SURFACE:
             var id = cmd[1];
+            /* A NEW_SURFACE for the same id can land in the same drain (decode
+             * writes surfaces[] immediately, this delete is deferred to the rAF
+             * phase): the entry then belongs to the new, live surface - leave
+             * it and its state alone. */
+            if (surfaces[id] !== cmd[2])
+                break;
 	    if (id == surfaceWithMouse) {
 		surfaceWithMouse = 0;
 	    }
 	    if (id == realSurfaceWithMouse) {
 		realSurfaceWithMouse = 0;
 		firstTouchDownId = null;
+		firstTouchDownRawId = null;
 	    }
            delete surfaces[id];
             break;
         case DISPLAY_OP_CHANGE_TEXTURE:
             var image = cmd[1];
             var texture = cmd[2];
-            // We need a new closure here to have a separate copy of "texture" for each iteration in the onload callback...
-            var block = function(t) {
-                image.src = t.url;
-                // Unref blob url when loaded
-                image.onload = function() { t.unref(); };
-            };
-            block(texture);
+            if (image && texture) {
+                // We need a new closure here to have a separate copy of "texture" for each iteration in the onload callback...
+                var block = function(t) {
+                    if (image.src !== t.url) {
+                        image.src = t.url;
+                        // Unref blob url when loaded (or on decode failure, so
+                        // the ref + blob url can't leak on a never-loading image).
+                        image.onload = function() { t.unref(); };
+                        image.onerror = image.onload;
+                    } else {
+                        // Same url: skip the re-decode, still release the decode ref.
+                        t.unref();
+                    }
+                };
+                block(texture);
+                if (flashed) { image.__content = true; image.__flashKind = (texture.batch === textureBatch) ? 3 : 1; flashed.push(image); }
+            }
             break;
         case DISPLAY_OP_CHANGE_TRANSFORM:
             var div = cmd[1];
-            var transform_string = cmd[2];
-            div.style["transform"] = transform_string;
+            if (div)
+                div.style["transform"] = cmd[2];
             break;
         default:
-            alert("Unknown display op " + command);
+            console.warn("broadway: unknown display op " + cmd[0]);
         }
+        } catch (e) {
+            console.warn("broadway: display op " + (cmd && cmd[0]) + " failed:", e);
+        }
+    }
+
+    /* Flash after the whole batch is applied so geometry is settled. Read all
+     * geometry first (one batched layout), then write all overlays, then a
+     * single timer recycles this frame's divs - the old per-node
+     * getBoundingClientRect + appendChild + setTimeout thrashed layout and
+     * hung the page under heavy scrolling. Colour by kind:
+     *   1 = received (node re-sent, texture cached) = magenta;
+     *   2 = reused (kept node + texture, just re-parented) = green;
+     *   3 = received + texture uploaded this frame (real traffic) = red. */
+    if (flashed) {
+        var rects = [];
+        var drawN = Math.min(flashed.length, FLASH_MAX);
+        for (var fi = 0; fi < drawN; fi++) {
+            var el = flashed[fi];
+            if (el && el.getBoundingClientRect) {
+                var r = el.getBoundingClientRect();
+                if (r.width >= 1 && r.height >= 1)
+                    rects.push({ r: r, kind: el.__flashKind });
+            }
+        }
+        for (var fr = 0; fr < flashed.length; fr++)   /* reset all, incl. uncapped */
+            flashed[fr].__flashKind = 0;
+
+        var batch = [];
+        for (var dw = 0; dw < rects.length; dw++) {
+            var d = rects[dw];
+            var f = getFlashDiv();
+            f.style.left = d.r.left + "px";
+            f.style.top = d.r.top + "px";
+            f.style.width = d.r.width + "px";
+            f.style.height = d.r.height + "px";
+            f.style.background = d.kind === 2 ? "rgba(0,200,0,0.45)"
+                              : d.kind === 3 ? "rgba(255,0,0,0.65)"
+                              : "rgba(255,0,200,0.5)";
+            f.style.display = "block";
+            batch.push(f);
+        }
+        if (batch.length)
+            setTimeout(function () {
+                for (var k = 0; k < batch.length; k++) {
+                    batch[k].style.display = "none";
+                    flashPool.push(batch[k]);
+                }
+            }, FLASH_MS);
     }
 }
 
@@ -1068,6 +1641,7 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
 {
     var res = true;
     var need_restack = false;
+    textureBatch++;   /* textures uploaded in this message are "fresh" (real traffic) */
 
     while (res && cmd.pos < cmd.length) {
         var id, x, y, w, h, q, surface;
@@ -1075,9 +1649,40 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
         var command = cmd.get_uint8();
         lastSerial = cmd.get_32();
         switch (command) {
+        case BROADWAY_OP_SESSION:
+            var token = cmd.get_32();
+            var cid = cmd.get_32();
+            onSessionToken(token, cid);
+            break;
+
+        case BROADWAY_OP_PONG:
+            /* handleMessage already bumped lastPongTime. Measure the round-trip so
+             * the next PING reports it to the daemon's debug menu. */
+            if (pingSentTime)
+                lastRtt = Date.now() - pingSentTime;
+            break;
+
+        case BROADWAY_OP_DEBUG_FLASH:
+            paintFlashing = cmd.get_uint8() != 0;
+            break;
+
+        case BROADWAY_OP_DEBUG_SET_SCREEN:
+            var psw = cmd.get_16(), psh = cmd.get_16(), pss = cmd.get_uint8();
+            /* scale 0 = unpin (reset zoom); otherwise drive the normal resize path
+             * with the pinned values so the canvas rebuilds (no blank-until-zoom). */
+            if (pss > 0) {
+                pinnedScreen = { w: psw, h: psh, s: pss };
+            } else {
+                pinnedScreen = null;
+                loadSavedZoom();   /* unpin: restore the user's committed zoom, not hard 1.0 */
+                applyZoomTransform(zoomFactor);
+            }
+            sendScreenSizeChanged();
+            break;
+
         case BROADWAY_OP_DISCONNECTED:
-            alert ("disconnected");
-            inputSocket = null;
+            /* Another client took the display: unrecoverable. */
+            invalidateSession();
             break;
 
         case BROADWAY_OP_NEW_SURFACE:
@@ -1094,6 +1699,10 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
         case BROADWAY_OP_SHOW_SURFACE:
             id = cmd.get_16();
             surface = surfaces[id];
+            if (!surface) {
+                console.warn("broadway: SHOW_SURFACE references unknown surface " + id);
+                break;
+            }
             if (!surface.visible) {
                 surface.visible = true;
                 display_commands.push([DISPLAY_OP_SHOW_SURFACE, surface.div, surface.x, surface.y]);
@@ -1103,13 +1712,53 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
 
         case BROADWAY_OP_HIDE_SURFACE:
             id = cmd.get_16();
-            if (grab.surface == id)
-                doUngrab();
+            grabDrop(id);
             surface = surfaces[id];
+            if (!surface) {
+                console.warn("broadway: HIDE_SURFACE references unknown surface " + id);
+                break;
+            }
             if (surface.visible) {
                 surface.visible = false;
                 display_commands.push([DISPLAY_OP_HIDE_SURFACE, surface.div]);
+                need_restack = true; /* hidden modals must release their backdrop */
             }
+            break;
+
+        case BROADWAY_OP_SET_INPUT_REGION:
+            id = cmd.get_16();
+            var irMode = cmd.get_16();   /* 0 whole, 1 empty, 2 rect */
+            /* x/y are signed: a toplevel's resize border sits just outside the
+             * surface (negative), so read them as get_16s, not get_16. */
+            var irX = cmd.get_16s(), irY = cmd.get_16s(), irW = cmd.get_16(), irH = cmd.get_16();
+            surface = surfaces[id];
+            if (surface)
+                setInputRegion(surface, irMode, irX, irY, irW, irH);
+            break;
+
+        case BROADWAY_OP_REASSERT_POINTER:
+            id = cmd.get_16();
+            var rx = cmd.get_16();
+            var ry = cmd.get_16();
+            /* The daemon asks us to re-assert pointer focus after a popup that
+             * held the (touch-emulated) pointer focus went away. Routing it
+             * through the normal input path (rather than injecting it daemon-
+             * side) gives the app's GTK a crossing with the live serial/time it
+             * needs to actually move pointer focus, unsticking touch input.
+             * The ENTER rebuilds the (stale) pointer focus; the immediately
+             * following LEAVE clears the mouse-hover state it would otherwise
+             * leave behind (spurious :hover styling / tooltips on touch).
+             *
+             * Touch only: with a real mouse the ungrab crossing already restored
+             * focus to the hovered surface, and this LEAVE would wrongly drop that
+             * hover while the cursor sits still -- stranding e.g. a menu button
+             * (can't reopen until the pointer moves). Skip when a mouse is over a
+             * surface; touch leaves realSurfaceWithMouse at 0 (taps preventDefault
+             * the emulated mouse crossings). */
+            if (realSurfaceWithMouse != 0)
+                break;
+            sendInput(BROADWAY_EVENT_ENTER, [id, id, rx, ry, rx, ry, lastState, GDK_CROSSING_NORMAL]);
+            sendInput(BROADWAY_EVENT_LEAVE, [id, id, rx, ry, rx, ry, lastState, GDK_CROSSING_NORMAL]);
             break;
 
         case BROADWAY_OP_SET_TRANSIENT_FOR:
@@ -1128,18 +1777,23 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
         case BROADWAY_OP_DESTROY_SURFACE:
             id = cmd.get_16();
 
-            if (grab.surface == id)
-                doUngrab();
+            grabDrop(id);
 
             surface = surfaces[id];
+            if (!surface) {
+                console.warn("broadway: DESTROY_SURFACE references unknown surface " + id);
+                break;
+            }
             var i = stackingOrder.indexOf(surface);
             if (i >= 0)
                 stackingOrder.splice(i, 1);
+            need_restack = true; /* a destroyed modal must drop the scrim */
             var div = surface.div;
 
             display_commands.push([DISPLAY_OP_DELETE_NODE, div]);
             // We need to delay this until its really deleted because we can still get events to it
-            display_commands.push([DISPLAY_OP_DELETE_SURFACE, id]);
+            // Pass the surface object too: a NEW_SURFACE may reuse the id before the delete runs
+            display_commands.push([DISPLAY_OP_DELETE_SURFACE, id, surface]);
             break;
 
         case BROADWAY_OP_ROUNDTRIP:
@@ -1154,6 +1808,13 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
             var has_pos = ops & 1;
             var has_size = ops & 2;
             surface = surfaces[id];
+            if (!surface) {
+                /* Consume the payload so the command stream stays in sync. */
+                if (has_pos) { cmd.get_16s(); cmd.get_16s(); }
+                if (has_size) { cmd.get_16(); cmd.get_16(); }
+                console.warn("broadway: MOVE_RESIZE references unknown surface " + id);
+                break;
+            }
             if (has_pos) {
                 surface.x = cmd.get_16s();
                 surface.y = cmd.get_16s();
@@ -1189,7 +1850,13 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
 
         case BROADWAY_OP_RELEASE_TEXTURE:
             id = cmd.get_32();
-            textures[id].unref();
+            /* A stale/double release would throw mid-message and desync the
+             * node table from the display ops. Skip gracefully like
+             * NODE_TEXTURE / PATCH_TEXTURE. */
+            if (textures[id])
+                textures[id].unref();
+            else
+                console.warn("broadway: RELEASE_TEXTURE references unknown texture " + id);
             break;
 
         case BROADWAY_OP_SET_NODES:
@@ -1203,6 +1870,11 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
 
                 var node_data = cmd.get_nodes ();
                 surface = surfaces[id];
+                if (!surface) {
+                    /* Payload already consumed above, safe to skip. */
+                    console.warn("broadway: SET_NODES references unknown surface " + id);
+                    break;
+                }
                 var transform_nodes = new TransformNodes (node_data, surface.div, surface.nodes, display_commands);
                 transform_nodes.execute();
             }
@@ -1220,8 +1892,102 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
             break;
 
         case BROADWAY_OP_SET_SHOW_KEYBOARD:
-            showKeyboard = cmd.get_16() != 0;
-            showKeyboardChanged = true;
+            var wantKeyboard = cmd.get_16() != 0;
+            if (wantKeyboard != showKeyboard) {
+                showKeyboard = wantKeyboard;
+                showKeyboardChanged = true;
+                /* GTK requests this within ~10-25ms of the tap that moved focus,
+                 * so the tap's transient activation is still live and focus()
+                 * can summon the keyboard now - no need to wait for the next
+                 * touch (which made the OSK lag a gesture behind). */
+                applyKeyboard();
+            }
+            break;
+
+        case BROADWAY_OP_SET_CLIPBOARD:
+            var _cbdata = cmd.get_data();
+            var _cbtext = new TextDecoder("utf-8").decode(_cbdata);
+            setHostClipboard(_cbtext);
+            break;
+
+        case BROADWAY_OP_OPEN_URI:
+            /* No system URI handler in a headless Broadway session, so the app
+             * routes link clicks here. Open them in a new browser tab. The
+             * call runs inside the WebSocket message handler (not a user
+             * gesture), so a popup blocker may catch it; 'noopener' keeps the
+             * new tab from reaching back into this page. */
+            var _uridata = cmd.get_data();
+            var _uri = new TextDecoder("utf-8").decode(_uridata);
+            /* Only open web/mail links; never javascript:/data:/blob: etc. */
+            if (/^(https?|mailto):/i.test(_uri))
+                window.open(_uri, "_blank", "noopener");
+            else
+                console.warn("broadway: refusing to open non-web URI:", _uri);
+            break;
+
+        case BROADWAY_OP_SET_CURSOR:
+            /* GTK drives the cursor per surface (resize edges, text, links, ...).
+             * Mirror it onto the surface div's CSS cursor; children inherit it. */
+            id = cmd.get_16();
+            var _curname = new TextDecoder("utf-8").decode(cmd.get_data());
+            surface = surfaces[id];
+            if (surface) {
+                if (!CSS_CURSOR_NAMES.has(_curname))
+                    _curname = "default";
+                surface.div.style.cursor = _curname;
+            }
+            break;
+
+        case BROADWAY_OP_SET_TITLE:
+            /* Window title -> document/tab title (the topmost toplevel wins). */
+            id = cmd.get_16();
+            var _title = new TextDecoder("utf-8").decode(cmd.get_data());
+            surface = surfaces[id];
+            if (surface)
+                surface.title = _title;
+            break;
+
+        case BROADWAY_OP_SET_ICON:
+            /* Window icon PNG bytes -> favicon as a data: URL (survives a reload
+             * via sessionStorage). Empty payload clears it. */
+            id = cmd.get_16();
+            var _icondata = cmd.get_data();
+            surface = surfaces[id];
+            if (surface)
+                surface.iconUrl = _icondata.length > 0 ? pngBytesToDataUrl(_icondata) : null;
+            break;
+
+        case BROADWAY_OP_SET_MODAL:
+            id = cmd.get_16();
+            var _modal = cmd.get_bool();
+            surface = surfaces[id];
+            if (surface && surface.modal != _modal) {
+                surface.modal = _modal;
+                need_restack = true;
+            }
+            break;
+
+        case BROADWAY_OP_REQUEST_CLIPBOARD:
+            /* IIFE so each request's id is captured by the async callbacks even
+             * if several requests arrive in one command batch. */
+            (function (id) {
+                if (Date.now() - pasteCacheTime < 1000) {
+                    /* A native paste event (Ctrl+V) just captured the clipboard:
+                     * answer from it with no permission popup. Consume it so a
+                     * later request can't reuse stale text. */
+                    pasteCacheTime = 0;
+                    sendClipboardContents(pasteCache, id);
+                } else if (navigator.clipboard && navigator.clipboard.readText) {
+                    /* No recent native paste (e.g. the right-click menu's Paste):
+                     * fall back to the async API. Silent on Chromium once
+                     * permission is granted; Firefox shows its one-time prompt. */
+                    navigator.clipboard.readText().then(
+                        function (t) { sendClipboardContents(t, id); },
+                        function (e) { sendClipboardContents("", id); });
+                } else {
+                    sendClipboardContents("", id);
+                }
+            })(cmd.get_32());
             break;
 
         default:
@@ -1232,6 +1998,9 @@ function handleCommands(cmd, display_commands, new_textures, modified_trees)
     if (need_restack)
         display_commands.push([DISPLAY_OP_RESTACK_SURFACES]);
 
+    /* Topmost toplevel may have changed; refresh tab title + favicon. */
+    updateTabIdentity();
+
     return res;
 }
 
@@ -1240,8 +2009,27 @@ function handleOutstandingDisplayCommands()
     if (outstandingDisplayCommands) {
         window.requestAnimationFrame(
             function () {
-                handleDisplayCommands(outstandingDisplayCommands);
+                /* A reconnect reset may have cleared the queue after this rAF
+                 * was scheduled; skip the stale frame. */
+                if (!outstandingDisplayCommands)
+                    return;
+                try {
+                    handleDisplayCommands(outstandingDisplayCommands);
+                } catch (e) {
+                    console.warn("broadway: handleDisplayCommands failed:", e);
+                }
                 outstandingDisplayCommands = null;
+
+                /* First repaint after a resume: drop the dim+spinner overlay. */
+                if (awaitFirstFrame) {
+                    awaitFirstFrame = false;
+                    reconnecting = false;
+                    if (resumeSafetyTimer) {
+                        clearTimeout(resumeSafetyTimer);
+                        resumeSafetyTimer = null;
+                    }
+                    hideOverlay();
+                }
 
                 if (outstandingCommands.length > 0)
                     setTimeout(handleOutstanding);
@@ -1331,12 +2119,18 @@ BinCommands.prototype.get_32 = function() {
 };
 BinCommands.prototype.get_nodes = function() {
     var len = this.get_32();
+    /* Clamp to what's left so a bad length can't throw RangeError and abort the
+     * whole batch (the daemon is trusted, so this is just belt-and-braces). */
+    var avail = (this.arraybuffer.byteLength - this.pos) >> 2;
+    if (len > avail) len = avail;
     var node_data = new DataView(this.arraybuffer, this.pos, len * 4);
     this.pos = this.pos + len * 4;
     return node_data;
 };
 BinCommands.prototype.get_data = function() {
     var size = this.get_32();
+    var avail = this.arraybuffer.byteLength - this.pos;
+    if (size > avail) size = avail;
     var data = new Uint8Array (this.arraybuffer, this.pos, size);
     this.pos = this.pos + size;
     return data;
@@ -1345,6 +2139,12 @@ BinCommands.prototype.get_data = function() {
 var active = false;
 function handleMessage(message)
 {
+    if (sessionInvalidated)
+        return;
+
+    lastPongTime = Date.now();     /* any inbound data proves the link is alive */
+    awaitingFirstMessage = false;
+
     if (!active) {
         start();
         active = true;
@@ -1357,30 +2157,202 @@ function handleMessage(message)
     }
 }
 
+/* Apply a surface's input region (BROADWAY_OP_SET_INPUT_REGION):
+ *  mode 0 (whole): the whole surface div takes pointer events (the default).
+ *  mode 1 (empty): nothing does - click-through (e.g. GtkTextHandle).
+ *  mode 2 (rect):  only the given rect is interactive; everything outside it
+ *                  (e.g. a popover's shadow margin) passes clicks through.
+ * For the rect case the surface div goes pointer-events:none - its rendered
+ * children inherit that - and one transparent hit div over the rect captures
+ * input. A click on it still resolves to this surface via getSurfaceId (the hit
+ * div's parent is surface.div, which carries .surface). */
+function setInputRegion(surface, mode, x, y, w, h) {
+    var div = surface.div;
+    if (surface.inputHit) {
+        surface.inputHit.remove();
+        surface.inputHit = null;
+    }
+    if (mode == 2) {
+        div.style.pointerEvents = "none";
+        var hit = document.createElement("div");
+        hit.style.cssText = "position:absolute;pointer-events:auto;background:transparent;";
+        hit.style.left = x + "px";
+        hit.style.top = y + "px";
+        hit.style.width = w + "px";
+        hit.style.height = h + "px";
+        div.appendChild(hit);
+        surface.inputHit = hit;
+    } else {
+        div.style.pointerEvents = (mode == 1) ? "none" : "auto";
+    }
+}
+
 function getSurfaceId(ev) {
     var target = ev.target;
-    while (target.surface == undefined) {
+    while (target && target.surface == undefined) {
         if (target == document)
             return 0;
         target = target.parentNode;
     }
 
-    return target.surface.id;
+    return (target && target.surface) ? target.surface.id : 0;
+}
+
+/* GTK only needs the latest pointer position, so buffer moves and send one per
+ * frame; a motion flood can't then fill the websocket and delay a later click
+ * or key (head-of-line blocking). Discrete events flush the pending move first
+ * to preserve ordering. */
+var pendingMove = null;
+var pendingMoveScheduled = false;
+
+function flushPendingMove()
+{
+    if (pendingMove == null)
+        return;
+    var args = pendingMove;
+    pendingMove = null;
+    rawSendInput(BROADWAY_EVENT_POINTER_MOVE, args);
+}
+
+function pendingMoveFrame()
+{
+    pendingMoveScheduled = false;
+    flushPendingMove();
+}
+
+function queuePointerMove(args)
+{
+    pendingMove = args;
+    if (!pendingMoveScheduled) {
+        pendingMoveScheduled = true;
+        window.requestAnimationFrame(pendingMoveFrame);
+    }
 }
 
 function sendInput(cmd, args)
 {
+    /* Flush any buffered move before a discrete event to keep ordering. */
+    if (cmd == BROADWAY_EVENT_POINTER_MOVE) {
+        queuePointerMove(args);
+        return;
+    }
+    flushPendingMove();
+    rawSendInput(cmd, args);
+}
+
+function rawSendInput(cmd, args)
+{
     if (inputSocket == null)
         return;
 
-    var fullArgs = [cmd, lastSerial, lastTimeStamp].concat(args);
-    var buffer = new ArrayBuffer(fullArgs.length * 4);
+    /* Pack fields straight into the buffer; avoids the per-event concat()/
+     * forEach() closure on the move/wheel hot path. */
+    var buffer = new ArrayBuffer((args.length + 3) * 4);
     var view = new DataView(buffer);
-    fullArgs.forEach(function(arg, i) {
-        view.setInt32(i*4, arg, false);
-    });
+    view.setInt32(0, cmd, false);
+    view.setInt32(4, lastSerial, false);
+    view.setInt32(8, lastTimeStamp, false);
+    for (var i = 0; i < args.length; i++)
+        view.setInt32((i + 3) * 4, args[i], false);
 
     inputSocket.send(buffer);
+}
+
+/* Best-effort copy into the host clipboard via the hidden textarea. Works on
+ * insecure (http) origins where navigator.clipboard is unavailable, but the
+ * browser may ignore execCommand('copy') outside a user gesture. */
+function copyViaTextarea(text)
+{
+    if (!clipboardArea) {
+        console.warn("broadway: cannot copy to host clipboard (no clipboard API)");
+        return;
+    }
+
+    var prev = clipboardArea.value;
+    clipboardArea.value = text;
+    clipboardArea.select();
+
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+
+    clipboardArea.value = prev;
+    /* select() stole focus from the OSK input; restore its intended state. */
+    if (clipboardArea === fakeInput) {
+        if (showKeyboard)
+            fakeInput.focus();
+        else
+            fakeInput.blur();
+    }
+    if (!ok)
+        console.warn("broadway: copy to host clipboard was rejected by the browser");
+}
+
+function setHostClipboard(text)
+{
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(function (e) {
+            copyViaTextarea(text);
+        });
+    } else {
+        copyViaTextarea(text);
+    }
+}
+
+function sendClipboardContents(text, id)
+{
+    if (inputSocket == null)
+        return;
+
+    /* Echo back the request id so the daemon can route this answer to the one
+     * client (and read) that asked for it. Layout: type, serial, time, id, len,
+     * then the UTF-8 text. */
+    var bytes = new TextEncoder().encode(text == null ? "" : text);
+    var buffer = new ArrayBuffer(4 * 5 + bytes.length);
+    var view = new DataView(buffer);
+    view.setInt32(0, BROADWAY_EVENT_CLIPBOARD_CONTENTS, false);
+    view.setInt32(4, lastSerial, false);
+    view.setInt32(8, lastTimeStamp, false);
+    view.setInt32(12, id, false);
+    view.setInt32(16, bytes.length, false);
+    new Uint8Array(buffer, 20).set(bytes);
+
+    inputSocket.send(buffer);
+}
+
+/* Commit literal text into the focused GTK widget as synthetic key events. A
+ * keyval of (codepoint | 0x01000000) is GDK's direct Unicode encoding. */
+function commitTextToGtk(text)
+{
+    if (!text)
+        return;
+
+    var state = lastState & ~(GDK_SHIFT_MASK|GDK_CONTROL_MASK|GDK_ALT_MASK);
+    text = text.replace(/\r\n?/g, "\n");
+
+    /* Iterate by code point so astral chars (e.g. emoji) commit as one keyval. */
+    for (var ch of text) {
+        var cp = ch.codePointAt(0);
+        /* Control chars need their named GDK keysym, not a direct-Unicode one:
+         * GtkText/GtkTextView treat 0xFF0D/0xFF09 as Return/Tab, but ignore a
+         * direct-Unicode LF, so pasted/IME-committed newlines would be lost. */
+        var keysym;
+        if (cp == 0x0A)      /* newline */
+            keysym = 0xFF0D; /* GDK_KEY_Return */
+        else if (cp == 0x09) /* tab */
+            keysym = 0xFF09; /* GDK_KEY_Tab */
+        else
+            keysym = cp | 0x01000000;
+        sendInput(BROADWAY_EVENT_KEY_PRESS, [keysym, state]);
+        sendInput(BROADWAY_EVENT_KEY_RELEASE, [keysym, state]);
+    }
+}
+
+/* Touch paste: forward straight into GTK rather than via pasteCache, which only
+ * feeds GTK's own clipboard request (desktop Ctrl+V) and would double-insert. */
+function capturePaste(text)
+{
+    lastPasteForwardTime = Date.now();
+    commitTextToGtk(text);
 }
 
 function getPositionsFromAbsCoord(absX, absY, relativeId) {
@@ -1401,8 +2373,11 @@ function getPositionsFromAbsCoord(absX, absY, relativeId) {
 
 function getPositionsFromEvent(ev, relativeId) {
     var absX, absY;
-    absX = ev.pageX;
-    absY = ev.pageY;
+    /* Page coords are physical CSS pixels; the #zoomRoot wrapper is scaled by
+     * zoomFactor (origin 0 0), so surface root coords are page coords / zoom.
+     * At zoom 1 this is a no-op (the desktop path is unchanged). */
+    absX = ev.pageX / zoomFactor;
+    absY = ev.pageY / zoomFactor;
     var res = getPositionsFromAbsCoord(absX, absY, relativeId);
 
     lastX = res.rootX;
@@ -1421,19 +2396,35 @@ function getEffectiveEventTarget (id) {
     return id;
 }
 
+function applyKeyboard() {
+    if (fakeInput == null)
+        return;
+    if (showKeyboard) {
+        if (isAndroidChrome) {
+            fakeInput.blur();
+            fakeInput.value = ' '.repeat(80); // TODO: Should be exchange with broadway server
+                                              // to bring real value here.
+        }
+        fakeInput.focus();
+    }
+    else
+        fakeInput.blur();
+}
+
+/* Reset the OSK input after consuming its text. On Android Chrome refill the
+ * space buffer (see applyKeyboard): on a visually empty field GBoard stops
+ * emitting deleteContentBackward, killing backspace. Assigning .value also
+ * puts the cursor back at the end. */
+function resetFakeInputValue() {
+    fakeInput.value = isAndroidChrome ? ' '.repeat(80) : "";
+}
+
+/* Fallback path: re-assert the keyboard state on a touch (a real gesture), in
+ * case applyKeyboard() ran while the transient activation window was closed. */
 function updateKeyboardStatus() {
     if (fakeInput != null && showKeyboardChanged) {
         showKeyboardChanged = false;
-        if (showKeyboard) {
-	    if (isAndroidChrome) {
-		fakeInput.blur();
-		fakeInput.value = ' '.repeat(80); // TODO: Should be exchange with broadway server
-		                                  // to bring real value here.
-	    }
-            fakeInput.focus();
-	}
-        else
-            fakeInput.blur();
+        applyKeyboard();
     }
 }
 
@@ -1460,6 +2451,15 @@ function onMouseMove (ev) {
 function onMouseOver (ev) {
     updateForEvent(ev);
 
+    /* During an implicit pointer grab (a mouse button held after pressing a
+     * widget) the pointer is confined to the grabbed surface, like an X11/GDK
+     * implicit grab. Suppress surface-crossing enter/leave -- which the document
+     * handlers otherwise fire on every DOM node boundary, even within one
+     * surface -- so e.g. dragging a scrollbar keeps tracking when the cursor
+     * wanders off the widget. Explicit grabs (menus/popovers) are unaffected. */
+    if (grab.surface != null && grab.implicit)
+        return;
+
     var id = getSurfaceId(ev);
     realSurfaceWithMouse = id;
     id = getEffectiveEventTarget (id);
@@ -1472,6 +2472,12 @@ function onMouseOver (ev) {
 
 function onMouseOut (ev) {
     updateForEvent(ev);
+
+    /* See onMouseOver: keep the implicit-grab surface even when the cursor
+     * leaves the widget, so a button drag isn't interrupted. */
+    if (grab.surface != null && grab.implicit)
+        return;
+
     var id = getSurfaceId(ev);
     var origId = id;
     id = getEffectiveEventTarget (id);
@@ -1484,10 +2490,27 @@ function onMouseOut (ev) {
     surfaceWithMouse = 0;
 }
 
+/* True when the last known pointer position lies within surface `sid`. */
+function pointerInSurface(sid) {
+    var s = surfaces[sid];
+    if (!s)
+        return false;
+    var x = lastX - s.x, y = lastY - s.y;
+    return x >= 0 && y >= 0 && x < s.width && y < s.height;
+}
+
 function doGrab(id, ownerEvents, implicit) {
     var pos;
 
-    if (surfaceWithMouse != id) {
+    /* Owner-events grab (menu/popover): only move pointer focus into the grab
+     * surface if the cursor is actually over it. A grab crossing into a surface
+     * the pointer isn't on races GTK's focus highlight -> menu-item flicker.
+     * Confining/implicit grabs still teleport - the pointer is confined there. */
+    var teleport = surfaceWithMouse != id;
+    if (teleport && ownerEvents && !pointerInSurface(id))
+        teleport = false;
+
+    if (teleport) {
         if (surfaceWithMouse != 0) {
             pos = getPositionsFromAbsCoord(lastX, lastY, surfaceWithMouse);
             sendInput (BROADWAY_EVENT_LEAVE, [realSurfaceWithMouse, surfaceWithMouse, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState, GDK_CROSSING_GRAB]);
@@ -1497,13 +2520,28 @@ function doGrab(id, ownerEvents, implicit) {
         surfaceWithMouse = id;
     }
 
-    grab.surface = id;
-    grab.ownerEvents = ownerEvents;
-    grab.implicit = implicit;
+    /* Push, or update the top in place when re-grabbing the same surface. */
+    if (grabStack.length > 0 && grabStack[grabStack.length - 1].surface == id) {
+        grabStack[grabStack.length - 1].ownerEvents = ownerEvents;
+        grabStack[grabStack.length - 1].implicit = implicit;
+    } else {
+        grabStack.push({ surface: id, ownerEvents: ownerEvents, implicit: implicit });
+    }
+    updateGrabCache();
 }
 
 function doUngrab() {
     var pos;
+    if (grabStack.length == 0)
+        return;
+
+    /* Pop the innermost grab; a remaining parent keeps the chain alive. */
+    grabStack.pop();
+    updateGrabCache();
+
+    /* Restore pointer focus to where the cursor physically is - never teleport
+     * into the parent grab (same race as doGrab: clears the parent item's
+     * keyboard highlight). The remaining grab still routes input. */
     if (realSurfaceWithMouse != surfaceWithMouse) {
         if (surfaceWithMouse != 0) {
             pos = getPositionsFromAbsCoord(lastX, lastY, surfaceWithMouse);
@@ -1515,7 +2553,23 @@ function doUngrab() {
         }
         surfaceWithMouse = realSurfaceWithMouse;
     }
-    grab.surface = null;
+}
+
+/* A surface vanished (hidden/destroyed) while it (or a descendant) held a grab:
+ * pop it and everything stacked above it, mirroring the daemon's drop-through. */
+function grabDrop(id) {
+    var idx = -1;
+    for (var i = grabStack.length - 1; i >= 0; i--) {
+        if (grabStack[i].surface == id) { idx = i; break; }
+    }
+    if (idx < 0)
+        return;
+    /* Drop the levels above `id` silently, then ungrab `id` itself with the
+     * normal crossing restore. */
+    while (grabStack.length - 1 > idx)
+        grabStack.pop();
+    updateGrabCache();
+    doUngrab();
 }
 
 function onMouseDown (ev) {
@@ -1523,6 +2577,9 @@ function onMouseDown (ev) {
     var button = ev.button + 1;
     lastState = lastState | getButtonMask (button);
     var id = getSurfaceId(ev);
+    /* Touch-up clears the pointer cache; a mouse press may follow without
+     * another mouseover. Use this event's surface for keyboard focus. */
+    realSurfaceWithMouse = id;
     id = getEffectiveEventTarget (id);
 
     var pos = getPositionsFromEvent(ev, id);
@@ -1542,8 +2599,20 @@ function onMouseUp (ev) {
 
     sendInput (BROADWAY_EVENT_BUTTON_RELEASE, [realSurfaceWithMouse, id, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState, button]);
 
-    if (grab.surface != null && grab.implicit)
+    /* Release the press's implicit grab. If it's the top, release normally; if an
+     * explicit grab nested over it (a window move), the implicit grab is browser-
+     * local, so splice it out - else it strands and swallows the next press. */
+    if (grab.surface != null && grab.implicit) {
         doUngrab();
+    } else {
+        for (var i = grabStack.length - 1; i >= 0; i--) {
+            if (grabStack[i].implicit) {
+                grabStack.splice(i, 1);
+                updateGrabCache();
+                break;
+            }
+        }
+    }
 
     return false;
 }
@@ -3024,6 +4093,8 @@ function ignoreKeyEvent(ev) {
 function handleKeyDown(e) {
     var fev = null, ev = (e ? e : window.event), keysym = null, suppress = false;
 
+    noteShiftTaps(ev);
+
     fev = copyKeyEvent(ev);
 
     keysym = getKeysymSpecial(ev);
@@ -3044,6 +4115,13 @@ function handleKeyDown(e) {
     }
 
     if (suppress) {
+        // Paste (Ctrl+V, and Ctrl+Shift+V which yields the shifted 'V' keysym)
+        // must NOT be preventDefaulted: we still forward it to the app (so GTK
+        // runs its paste action) but we let the browser fire its native 'paste'
+        // event into the hidden textarea, which reads the clipboard without any
+        // permission popup.
+        if (ev.ctrlKey && !ev.altKey && (keysym === KEYSYM_v || keysym === KEYSYM_V))
+            return true;
         // Suppress bubbling/default actions
         return cancelEvent(ev);
     }
@@ -3078,8 +4156,13 @@ function handleKeyPress(e) {
     }
 
     // Send the translated keysym
-    if (keysym > 0)
+    if (keysym > 0) {
+        lastKeyPressTime = Date.now();
+        /* ev.key is the character this keyPress produced (e.g. "a"); used to
+         * match (not just time) the echoing 'beforeinput' on the touch OSK. */
+        lastKeyPressText = (typeof ev.key === "string") ? ev.key : "";
         sendInput (BROADWAY_EVENT_KEY_PRESS, [keysym, lastState]);
+    }
 
     // Stop keypress events just in case
     return cancelEvent(ev);
@@ -3150,11 +4233,6 @@ function onKeyUp (ev) {
     return handleKeyUp(ev);
 }
 
-function onInput (ev) {
-    updateForEvent(ev);
-    return handleInput(ev);
-}
-
 function cancelEvent(ev)
 {
     ev = ev ? ev : window.event;
@@ -3168,21 +4246,179 @@ function cancelEvent(ev)
     return false;
 }
 
+/* Smooth scroll: forward precise pixel deltas (fixed-point) instead of one step
+ * per wheel event, plus an idle 'stop' to end the sequence cleanly. No kinetic
+ * fling (disabled in gtkscrolledwindow). SCROLL_FIXED_SCALE matches
+ * BROADWAY_SCROLL_FIXED_SCALE (broadway-protocol.h). */
+const SCROLL_FIXED_SCALE = 1000;
+const SCROLL_LINE_HEIGHT = 16;   /* px per line for DOM_DELTA_PAGE fallback */
+const SCROLL_STOP_MS = 80;       /* idle after the last wheel before the stop */
+var scrollStopTimer = null;
+var scrollStopArgs = null;
+
+/* Ctrl+wheel zoom for engines that pinch instead of reflowing (Blink/WebKit).
+ * Like a touch pinch: cursor-anchored preview during the burst, one crisp reflow
+ * on settle - GTK isn't reflowed per notch and the view grows from the cursor. */
+function wheelZoom(ev) {
+    if (pinnedScreen)          /* screen pinned: zoom is fixed */
+        return;
+    var dy = ev.deltaY;
+    if (!dy)
+        return;
+    if (!wheelBurstActive) {
+        wheelBurstActive = true;
+        wheelStartZoom = zoomFactor;   /* committed zoom: transform is a plain scale */
+        wheelFocusX = ev.clientX;
+        wheelFocusY = ev.clientY;
+    }
+    /* Exponential step: scroll up (dy < 0) zooms in, down zooms out. */
+    var z = clampZoom(zoomFactor * Math.exp(-dy * ZOOM_WHEEL_SENS));
+    if (z != zoomFactor) {
+        zoomFactor = z;
+        applyWheelPreview();
+    }
+    /* Restart the settle timer; commit once the notches stop. */
+    if (wheelSettleTimer != null)
+        clearTimeout(wheelSettleTimer);
+    wheelSettleTimer = setTimeout(commitWheelZoom, 200);
+}
+
+/* Burst over: report the new size so GTK relays out crisp, then drop the preview
+ * translate back to a plain scale (which the reflow fills). Mirrors endPinch. */
+function commitWheelZoom() {
+    wheelSettleTimer = null;
+    wheelBurstActive = false;
+    if (pinnedScreen) {
+        applyZoomTransform(1.0);
+        return;
+    }
+    saveZoom();
+    sendScreenSizeChanged();
+    applyZoomTransform(zoomFactor);
+}
+
 function onMouseWheel(ev)
 {
     updateForEvent(ev);
     ev = ev ? ev : window.event;
 
+    /* Ctrl+wheel (and trackpad pinch, reported as ctrlKey) is a zoom gesture.
+     * Gecko page-zooms natively and reflows GTK - leave it; Blink/WebKit only
+     * visual-viewport pinch (no reflow), so drive zoom ourselves (#55). */
+    if (ev.ctrlKey) {
+        if (isGecko)
+            return;
+        wheelZoom(ev);
+        return cancelEvent(ev);
+    }
+
     var id = getSurfaceId(ev);
     var pos = getPositionsFromEvent(ev, id);
 
-    var offset = ev.detail ? ev.detail : -ev.wheelDelta;
-    var dir = 0;
-    if (offset > 0)
-        dir = 1;
-    sendInput (BROADWAY_EVENT_SCROLL, [realSurfaceWithMouse, id, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState, dir]);
+    /* Standard 'wheel' carries signed deltaX/deltaY; fall back to legacy
+     * DOMMouseScroll (detail) / mousewheel (wheelDelta) for old browsers. */
+    var dx = ev.deltaX;
+    var dy = ev.deltaY;
+    if (dx === undefined && dy === undefined) {
+        dy = ev.detail ? ev.detail : -ev.wheelDelta;
+        dx = 0;
+    }
+    dx = dx || 0;
+    dy = dy || 0;
+
+    /* DOM_DELTA_LINE (notched wheel) -> wheel-click unit, deltas are clicks;
+     * DOM_DELTA_PIXEL (touchpad / precise wheel) -> surface pixels; PAGE is
+     * rare, approximate it in pixels. The horizontal axis still goes through
+     * (Firefox would otherwise turn it into a back/forward gesture, which the
+     * preventDefault in cancelEvent suppresses). */
+    var unit;
+    if (ev.deltaMode === 1) {        /* DOM_DELTA_LINE */
+        unit = 0;                     /* GDK_SCROLL_UNIT_WHEEL */
+    } else {
+        unit = 1;                     /* GDK_SCROLL_UNIT_SURFACE */
+        if (ev.deltaMode === 2) {     /* DOM_DELTA_PAGE */
+            dx *= SCROLL_LINE_HEIGHT * 40;
+            dy *= SCROLL_LINE_HEIGHT * 40;
+        }
+    }
+
+    if (dx == 0 && dy == 0)
+        return cancelEvent(ev);
+
+    var fdx = Math.round(dx * SCROLL_FIXED_SCALE);
+    var fdy = Math.round(dy * SCROLL_FIXED_SCALE);
+
+    if (scrollStopTimer != null) {
+        window.clearTimeout(scrollStopTimer);
+        scrollStopTimer = null;
+    }
+
+    sendInput (BROADWAY_EVENT_SCROLL, [realSurfaceWithMouse, id, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState, fdx, fdy, unit, 0]);
+
+    /* Arm the stop marker (is_stop=1) that ends the sequence, same target. */
+    scrollStopArgs = [realSurfaceWithMouse, id, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState, 0, 0, unit, 1];
+    scrollStopTimer = window.setTimeout(sendScrollStop, SCROLL_STOP_MS);
 
     return cancelEvent(ev);
+}
+
+/* rawSendInput keeps the last scroll's timestamp, ending the sequence in order. */
+function sendScrollStop()
+{
+    scrollStopTimer = null;
+    if (scrollStopArgs == null)
+        return;
+    rawSendInput (BROADWAY_EVENT_SCROLL, scrollStopArgs);
+    scrollStopArgs = null;
+}
+
+/* Cancel the in-flight single-finger GTK touch (if any) when a pinch starts, so
+ * GTK doesn't keep a dangling sequence AND doesn't read begin->end as a tap that
+ * leaks through to the widget under the fingers. Touch type 3 == GDK_TOUCH_CANCEL
+ * (gdkeventsource.c) aborts the sequence with no activation, unlike a type-2 end,
+ * which a click gesture treats as a tap. */
+function endInFlightGtkTouch() {
+    if (firstTouchDownId == null)
+        return;
+    var pt = activeTouches[firstTouchDownRawId];
+    if (pt != null) {
+        var origId = touchSurfaceIds[firstTouchDownRawId];
+        if (origId === undefined)
+            origId = 0;
+        var id = getEffectiveEventTarget (origId);
+        var pos = getPositionsFromAbsCoord(pt.x / zoomFactor, pt.y / zoomFactor, id);
+        sendInput (BROADWAY_EVENT_TOUCH, [3, id, firstTouchDownId, 1, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState]);
+    }
+    delete touchSurfaceIds[firstTouchDownRawId];
+    firstTouchDownId = null;
+    firstTouchDownRawId = null;
+}
+
+function beginPinch() {
+    /* A touch pinch cancels any in-flight wheel-zoom burst so its settle can't
+     * fire mid-pinch and stomp the transform. */
+    if (wheelSettleTimer != null) {
+        clearTimeout(wheelSettleTimer);
+        wheelSettleTimer = null;
+    }
+    wheelBurstActive = false;
+    pinchActive = true;
+    suppressTouchForward = true;
+    pinchStartZoom = zoomFactor;
+    pinchStartDist = activeTouchDistance();
+    pinchStartMid = activeTouchMidpoint();
+    endInFlightGtkTouch();
+}
+
+/* Commit the live-previewed zoom: report the new (reflowed, crisper) size so GTK
+ * re-renders sharp; the wrapper transform already shows the magnified view. */
+function endPinch() {
+    pinchActive = false;
+    if (pinnedScreen)      /* screen is pinned: zoom is fixed, nothing to commit */
+        return;
+    saveZoom();
+    sendScreenSizeChanged();
+    applyZoomTransform(zoomFactor);
 }
 
 function onTouchStart(ev) {
@@ -3191,46 +4427,108 @@ function onTouchStart(ev) {
     updateKeyboardStatus();
     updateForEvent(ev);
 
+    /* Track every finger for pinch-distance math. */
+    for (var i = 0; i < ev.changedTouches.length; i++) {
+        var t = ev.changedTouches.item(i);
+        activeTouches[t.identifier] = { x: t.pageX, y: t.pageY };
+    }
+
+    /* Two or more fingers => pinch-zoom: consume the gesture, don't forward it
+     * to GTK as touches. */
+    if (activeTouchCount() >= 2) {
+        if (!pinchActive)
+            beginPinch();
+        armHoldMenu();   /* (re)start the two-finger press-and-hold timer */
+        return;
+    }
+    /* A finger left over from a just-ended pinch is never forwarded, so it can't
+     * kick off a stray GTK touch. */
+    if (suppressTouchForward)
+        return;
+
     for (var i = 0; i < ev.changedTouches.length; i++) {
         var touch = ev.changedTouches.item(i);
 	var touchId = touchIdentifierStart(touch.identifier);
 
         var origId = getSurfaceId(touch);
+        touchSurfaceIds[touch.identifier] = origId;
         var id = getEffectiveEventTarget (origId);
         var pos = getPositionsFromEvent(touch, id);
         var isEmulated = 0;
 
         if (firstTouchDownId == null) {
             firstTouchDownId = touchId;
+            firstTouchDownRawId = touch.identifier;
             isEmulated = 1;
 
-            if (realSurfaceWithMouse != origId || id != surfaceWithMouse) {
-                if (id != 0) {
-                    sendInput (BROADWAY_EVENT_LEAVE, [realSurfaceWithMouse, id, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState, GDK_CROSSING_NORMAL]);
-                }
-
-                surfaceWithMouse = id;
-                realSurfaceWithMouse = origId;
-
-                sendInput (BROADWAY_EVENT_ENTER, [origId, id, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState, GDK_CROSSING_NORMAL]);
-            }
+            /* Track the touched surface (grab handling needs it), but emit no
+             * ENTER/LEAVE pointer crossings: they ride the mouse device, so GTK
+             * would read a tap as mouse hover and show :hover styling and
+             * tooltips. GtkTooltip only suppresses tooltips for
+             * GDK_SOURCE_TOUCHSCREEN events; the touch events route the tap. */
+            surfaceWithMouse = id;
+            realSurfaceWithMouse = origId;
         }
 
         sendInput (BROADWAY_EVENT_TOUCH, [0, id, touchId, isEmulated, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState]);
     }
+
+    /* Touch events stay targeted at the node the touch began on; once GTK
+     * repaints that surface the node is detached from the DOM and move/end
+     * events stop bubbling to document. Listen on the target itself so the
+     * gesture keeps flowing (the document listeners stay as a fallback; the
+     * handlers de-dupe). addEventListener de-dupes and detached nodes are
+     * garbage-collected, so no teardown is needed. */
+    if (ev.target && ev.target.addEventListener) {
+        ev.target.addEventListener('touchmove', onTouchMove, {passive: false});
+        ev.target.addEventListener('touchend', onTouchEnd, {passive: false});
+        ev.target.addEventListener('touchcancel', onTouchEnd, {passive: false});
+    }
 }
 
 function onTouchMove(ev) {
+    /* Reaches us from both the document and the touchstart-target listener. */
+    if (ev.broadwayHandled)
+        return;
+    ev.broadwayHandled = true;
     ev.preventDefault();
 
     updateKeyboardStatus();
     updateForEvent(ev);
 
+    /* Keep finger positions current for pinch-distance math. */
+    for (var i = 0; i < ev.changedTouches.length; i++) {
+        var t = ev.changedTouches.item(i);
+        if (activeTouches[t.identifier] != null)
+            activeTouches[t.identifier] = { x: t.pageX, y: t.pageY };
+    }
+
+    if (pinchActive) {
+        /* A pinned screen fixes the zoom: capture the two-finger gesture (no
+         * forward) but skip the preview, so it can't fight the pin or snap back. */
+        if (!pinnedScreen) {
+            var dist = activeTouchDistance();
+            if (pinchStartDist > 0 && dist > 0) {
+                /* Magnify live around the pinch midpoint, floating with the fingers
+                 * (the bitmap may be briefly soft); the crisp reflow is committed on
+                 * touch-end. */
+                zoomFactor = clampZoom(pinchStartZoom * (dist / pinchStartDist));
+                applyPinchPreview();
+            }
+        }
+        holdMenuCheckDrift();   /* finger movement = real pinch/pan, abort hold */
+        return;
+    }
+    if (suppressTouchForward)
+        return;
+
     for (var i = 0; i < ev.changedTouches.length; i++) {
         var touch = ev.changedTouches.item(i);
 	var touchId = touchIdentifier(touch.identifier);
 
-        var origId = getSurfaceId(touch);
+        var origId = touchSurfaceIds[touch.identifier];
+        if (origId === undefined)
+            origId = getSurfaceId(touch);
         var id = getEffectiveEventTarget (origId);
         var pos = getPositionsFromEvent(touch, id);
 
@@ -3244,16 +4542,66 @@ function onTouchMove(ev) {
 }
 
 function onTouchEnd(ev) {
+    /* Reaches us from both the document and the touchstart-target listener. */
+    if (ev.broadwayHandled)
+        return;
+    ev.broadwayHandled = true;
     ev.preventDefault();
 
     updateKeyboardStatus();
     updateForEvent(ev);
 
+    /* Drop lifted fingers from pinch tracking. */
+    for (var i = 0; i < ev.changedTouches.length; i++) {
+        var t = ev.changedTouches.item(i);
+        delete activeTouches[t.identifier];
+    }
+
+    /* A lifted finger breaks the two-finger hold. */
+    if (activeTouchCount() < 2)
+        cancelHoldMenu();
+
+    /* Last finger up: a touch leaves no pointer behind, so drop the mouse-focus
+     * trackers the tap set in onTouchStart. Only the touched surface's own
+     * destruction used to clear them, so dismissing a popup by tapping *outside*
+     * it left realSurfaceWithMouse pinned to the (surviving) parent - and
+     * REASSERT_POINTER then read that as "a real mouse is hovering" and skipped
+     * the unstick, stranding pointer focus on the dead popup. */
+    if (activeTouchCount() == 0) {
+        surfaceWithMouse = 0;
+        realSurfaceWithMouse = 0;
+    }
+
+    if (pinchActive) {
+        if (activeTouchCount() < 2)
+            endPinch();
+        return; /* pinch fingers are never forwarded as touches */
+    }
+    if (suppressTouchForward) {
+        /* Pinch already committed but fingers still down: keep suppressing until
+         * all lift, so a lingering finger can't start a stray GTK touch. */
+        if (activeTouchCount() == 0)
+            suppressTouchForward = false;
+        return;
+    }
+
+    /* A browser `touchcancel` is an aborted touch, NOT a completed tap: forward
+     * it as GDK_TOUCH_CANCEL (type 3), not a type-2 end. This is the real
+     * pinch-leak fix: mobile Firefox fires `touchcancel` on the first finger
+     * when the second lands; if that beats the pinch-begin (touchstart of finger
+     * 2) it reaches here while !pinchActive, and a type-2 end would make GTK read
+     * begin->end as a tap that activates the widget under the fingers. A type-2
+     * end stays only for a genuine `touchend`. */
+    var touchType = (ev.type === 'touchcancel') ? 3 : 2;
+
     for (var i = 0; i < ev.changedTouches.length; i++) {
         var touch = ev.changedTouches.item(i);
 	var touchId = touchIdentifier(touch.identifier);
 
-        var origId = getSurfaceId(touch);
+        var origId = touchSurfaceIds[touch.identifier];
+        if (origId === undefined)
+            origId = getSurfaceId(touch);
+        delete touchSurfaceIds[touch.identifier];
         var id = getEffectiveEventTarget (origId);
         var pos = getPositionsFromEvent(touch, id);
 
@@ -3261,10 +4609,102 @@ function onTouchEnd(ev) {
         if (firstTouchDownId == touchId) {
             isEmulated = 1;
             firstTouchDownId = null;
+            firstTouchDownRawId = null;
         }
 
-        sendInput (BROADWAY_EVENT_TOUCH, [2, id, touchId, isEmulated, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState]);
+        sendInput (BROADWAY_EVENT_TOUCH, [touchType, id, touchId, isEmulated, pos.rootX, pos.rootY, pos.winX, pos.winY, lastState]);
     }
+}
+
+/* ---- Debug menu summon triggers ----------------------------------------
+ * Two ways to summon the debug menu, both chosen to be inert to any GTK app and
+ * safe in any browser:
+ *   - keyboard: triple-tap Shift (nothing else between the taps)
+ *   - touch:    two-finger press-and-hold for HOLD_MENU_MS
+ * Neither costs input latency. A bare Shift is a no-op modifier, so we observe
+ * the taps while still forwarding each Shift to GTK as usual. On this backend
+ * 2+ fingers already drive pinch-zoom client-side and are never forwarded to
+ * GTK, so the hold layers onto the existing pinch path: real pinches/pans move
+ * the fingers and trip the slop check (aborting the hold), while single-finger
+ * drags never reach here at all.
+ *
+ * onSummonMenu() is the single fire point: it sends BROADWAY_EVENT_MENU to the
+ * daemon, which spawns (or toggles) a native GTK4 menu window on demand. The
+ * menu is purely server-side - it composites into the same display, so any
+ * connected browser (desktop or mobile) sees it. */
+
+var SHIFT_TAP_MS = 600;        /* max gap between Shift taps */
+var shiftTapCount = 0;
+var shiftLastTap = 0;
+
+/* Observer only - does not consume the Shift, so no latency and no swallowed
+ * modifier. Any non-Shift key, or auto-repeat from a held Shift, breaks the run. */
+function noteShiftTaps(ev) {
+    if (ev.keyCode !== 16) { shiftTapCount = 0; return; }   /* 16 = Shift (L/R) */
+    if (ev.repeat) return;                                  /* ignore held-key repeat */
+    var now = Date.now();
+    shiftTapCount = (now - shiftLastTap <= SHIFT_TAP_MS) ? shiftTapCount + 1 : 1;
+    shiftLastTap = now;
+    if (shiftTapCount >= 3) {
+        shiftTapCount = 0;
+        onSummonMenu();
+    }
+}
+
+var HOLD_MENU_MS = 2500;       /* "several seconds" of stillness to summon */
+var HOLD_MENU_SLOP = 16;       /* px a finger may drift before it counts as a gesture */
+var holdMenuTimer = null;
+var holdMenuAnchors = null;    /* {identifier: {x,y}} captured when the hold armed */
+
+/* Armed when a second finger lands (alongside beginPinch). We never withhold the
+ * fingers from the pinch path, so the common pinch/pan case is unchanged. */
+function armHoldMenu() {
+    cancelHoldMenu();
+    holdMenuAnchors = {};
+    for (var id in activeTouches)
+        holdMenuAnchors[id] = { x: activeTouches[id].x, y: activeTouches[id].y };
+    holdMenuTimer = setTimeout(function () {
+        holdMenuTimer = null;
+        holdMenuAnchors = null;
+        onSummonMenu();
+    }, HOLD_MENU_MS);
+}
+
+function cancelHoldMenu() {
+    if (holdMenuTimer) {
+        clearTimeout(holdMenuTimer);
+        holdMenuTimer = null;
+    }
+    holdMenuAnchors = null;
+}
+
+/* Any finger drifting past the slop means a real pinch/pan, not a hold: abort. */
+function holdMenuCheckDrift() {
+    if (!holdMenuAnchors)
+        return;
+    for (var id in activeTouches) {
+        var a = holdMenuAnchors[id];
+        if (!a) { cancelHoldMenu(); return; }   /* finger set changed */
+        var dx = activeTouches[id].x - a.x;
+        var dy = activeTouches[id].y - a.y;
+        if (dx * dx + dy * dy > HOLD_MENU_SLOP * HOLD_MENU_SLOP) {
+            cancelHoldMenu();
+            return;
+        }
+    }
+}
+
+function onSummonMenu() {
+    sendInput(BROADWAY_EVENT_MENU, []);
+}
+
+/* Heuristic for phones/tablets, where focusing an offscreen input summons the
+ * on-screen keyboard (wanted for GTK entries) and focusing a textarea would do
+ * so unwantedly (so the clipboard capture textarea is skipped there). */
+function isTouchDevice()
+{
+    return (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) ||
+           /(iPad|iPhone|iPod|Android)/i.test(navigator.userAgent);
 }
 
 function setupDocument(document)
@@ -3280,27 +4720,203 @@ function setupDocument(document)
     document.onkeyup = onKeyUp;
 
     if (document.addEventListener) {
-	document.addEventListener('DOMMouseScroll', onMouseWheel, passiveSupported ? { passive: false, capture: false } : false);
-	document.addEventListener('mousewheel', onMouseWheel, passiveSupported ? { passive: false, capture: false } : false);
-	document.addEventListener('touchstart', onTouchStart, passiveSupported ? { passive: false, capture: false } : false);
-	document.addEventListener('touchmove', onTouchMove, passiveSupported ? { passive: false, capture: false } : false);
-	document.addEventListener('touchend', onTouchEnd, passiveSupported ? { passive: false, capture: false } : false);
+      /* Standard wheel event (covers vertical + horizontal). passive:false so
+       * preventDefault() actually fires - needed to stop Firefox turning a
+       * horizontal touchpad swipe into a back/forward navigation gesture. */
+      document.addEventListener('wheel', onMouseWheel, {passive: false});
+      /* passive:false is required or the browser ignores preventDefault() in
+       * the handlers (touch listeners on the document default to passive), and
+       * Firefox/Android then cancels the touch on the slightest move - turning
+       * taps into touchcancel and eating roughly half of them. */
+      document.addEventListener('touchstart', onTouchStart, passiveSupported ? { passive: false, capture: false } : false);
+      document.addEventListener('touchmove', onTouchMove, passiveSupported ? { passive: false, capture: false } : false);
+      document.addEventListener('touchend', onTouchEnd, passiveSupported ? { passive: false, capture: false } : false);
+      /* Still handle touchcancel (system-initiated): end the sequence like a
+       * normal touchend so firstTouchDownId and the GTK grab aren't stranded. */
+      document.addEventListener('touchcancel', onTouchEnd, passiveSupported ? { passive: false, capture: false } : false);
     } else if (document.attachEvent) {
       element.attachEvent("onmousewheel", onMouseWheel);
     }
+
+    /* Non-touch only: keep a hidden textarea focused to capture native 'paste'
+     * (Ctrl+V / menu Paste) events. On touch devices (phones/tablets) a focused
+     * textarea would pop up the on-screen keyboard, so skip it there. A
+     * fine-pointer touch laptop still keeps the feature. */
+    if (!isTouchDevice() && document.addEventListener) {
+        clipboardArea = document.createElement("textarea");
+        clipboardArea.setAttribute("autocapitalize", "off");
+        clipboardArea.setAttribute("autocomplete", "off");
+        clipboardArea.setAttribute("autocorrect", "off");
+        clipboardArea.spellcheck = false;
+        clipboardArea.style.position = "absolute";
+        clipboardArea.style.left = "-1000px";
+        clipboardArea.style.top = "-1000px";
+        clipboardArea.style.width = "1px";
+        clipboardArea.style.height = "1px";
+        clipboardArea.style.opacity = "0";
+        document.body.appendChild(clipboardArea);
+
+        clipboardArea.addEventListener("paste", function (ev) {
+            var t = "";
+            if (ev.clipboardData && ev.clipboardData.getData)
+                t = ev.clipboardData.getData("text/plain");
+            else if (window.clipboardData && window.clipboardData.getData)
+                t = window.clipboardData.getData("Text");
+            pasteCache = (t == null) ? "" : t;
+            pasteCacheTime = Date.now();
+            /* Cache only; never insert into the hidden textarea. */
+            ev.preventDefault();
+        });
+        /* Compose key / dead key / desktop IME: e.g. Compose+a+' -> á. The
+         * sequence produces no usable keyPress (the keydowns are keyCode-229);
+         * the browser commits the result via composition into this focused
+         * textarea. Forward that committed text to GTK. Normal keys stay on the
+         * keyPress path (which preventDefaults its own beforeinput echo) and
+         * paste stays on the pasteCache path above. */
+        clipboardArea.addEventListener("compositionstart", function () {
+            imeComposing = true;
+        });
+        clipboardArea.addEventListener("compositionend", function (ev) {
+            imeComposing = false;
+            lastCompositionEndTime = Date.now();
+            lastCompositionText = ev.data || "";
+            if (ev.data)
+                commitTextToGtk(ev.data);
+            clipboardArea.value = "";
+        });
+        clipboardArea.addEventListener("beforeinput", function (ev) {
+            /* Composition commits on compositionend; paste is cached for GTK's
+             * own request; backspace/delete go via the keyPress path. Ignore
+             * those echoes here so nothing double-inserts. */
+            if (imeComposing ||
+                ev.inputType === "insertFromPaste" ||
+                ev.inputType === "deleteContentBackward" ||
+                ev.inputType === "deleteContentForward")
+                return;
+            if (ev.inputType === "insertText" ||
+                ev.inputType === "insertReplacementText") {
+                /* Don't re-send a char the keyPress or compositionend already
+                 * forwarded (matched by value, so a different char survives). */
+                if (ev.data === lastKeyPressText &&
+                    Date.now() - lastKeyPressTime < INPUT_ECHO_WINDOW_MS)
+                    return;
+                if (ev.data === lastCompositionText &&
+                    Date.now() - lastCompositionEndTime < INPUT_ECHO_WINDOW_MS)
+                    return;
+                if (ev.data) {
+                    commitTextToGtk(ev.data);
+                    clipboardArea.value = "";
+                }
+                ev.preventDefault();
+            }
+        });
+        /* Refocus the capture textarea when the user interacts with the app or
+         * returns to the tab, so the next paste is captured here - without
+         * holding focus hostage from other elements via a tight blur loop. */
+        document.addEventListener("mousedown", function () {
+            if (clipboardArea) clipboardArea.focus();
+        });
+        window.addEventListener("focus", function () {
+            if (clipboardArea) clipboardArea.focus();
+        });
+        clipboardArea.focus();
+    }
+}
+
+/* prefers-color-scheme -> freedesktop color-scheme (1 dark, 2 light, 0 none). */
+function currentColorScheme() {
+    if (!window.matchMedia)
+        return 0;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? 1 : 2;
+}
+
+function sendColorScheme() {
+    sendInput(BROADWAY_EVENT_COLOR_SCHEME, [currentColorScheme()]);
+}
+
+var colorSchemeWatch = null;
+function watchColorScheme() {
+    if (colorSchemeWatch || !window.matchMedia)
+        return;
+    colorSchemeWatch = window.matchMedia("(prefers-color-scheme: dark)");
+    var onChange = function() { sendColorScheme(); };
+    /* addEventListener('change') is the modern API; older Safari used addListener. */
+    if (colorSchemeWatch.addEventListener)
+        colorSchemeWatch.addEventListener("change", onChange);
+    else if (colorSchemeWatch.addListener)
+        colorSchemeWatch.addListener(onChange);
+}
+
+function sendReducedMotion() {
+    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    sendInput(BROADWAY_EVENT_REDUCED_MOTION, [reduce ? 1 : 0]);
+}
+
+var reducedMotionWatch = null;
+function watchReducedMotion() {
+    if (reducedMotionWatch || !window.matchMedia)
+        return;
+    reducedMotionWatch = window.matchMedia("(prefers-reduced-motion: reduce)");
+    if (reducedMotionWatch.addEventListener)
+        reducedMotionWatch.addEventListener("change", sendReducedMotion);
+    else if (reducedMotionWatch.addListener)
+        reducedMotionWatch.addListener(sendReducedMotion);
 }
 
 function sendScreenSizeChanged() {
     var w, h, s;
-    w = window.innerWidth;
-    h = window.innerHeight;
-    s = Math.round(window.devicePixelRatio);
+    /* Touch pinch-zoom: report a logical size shrunk by zoomFactor and a
+     * render scale bumped by it, so GTK re-lays-out smaller and renders crisper;
+     * the #zoomRoot transform then magnifies that back to fill the viewport.
+     * At zoom 1 this is byte-identical to the unmodified behaviour (desktop,
+     * which gets its own crisp zoom from the browser's native page-zoom). */
+    if (pinnedScreen) {
+        /* Debug pin: report the exact requested logical size + integer scale, shown
+         * at natural size (1 logical px : 1 CSS px, no magnification) - a small
+         * screen is a small square top-left, like a browser zoom-out re-render.
+         * zoomFactor stays 1 so pointer remap (pageX/Y / zoomFactor) lines up. */
+        zoomFactor = 1.0;
+        applyZoomTransform(1.0);
+        w = pinnedScreen.w;
+        h = pinnedScreen.h;
+        s = pinnedScreen.s;
+    } else {
+        w = Math.round(window.innerWidth / zoomFactor);
+        h = Math.round(window.innerHeight / zoomFactor);
+        s = Math.max(1, Math.round(window.devicePixelRatio * zoomFactor));
+    }
     sendInput (BROADWAY_EVENT_SCREEN_SIZE_CHANGED, [w, h, s]);
 }
 
 function start()
 {
+    zoomRoot = document.getElementById('zoomRoot') || document.body;
+    /* Restore a zoom saved from a previous session before the initial
+     * sendScreenSizeChanged() below, so GTK lays out at the right size at once. */
+    loadSavedZoom();
+    applyZoomTransform(zoomFactor);
+
     setupDocument(document);
+
+    /* Recovery triggers: visibility/pageshow reconnect if down, online forces
+     * it, offline shows the overlay. Heartbeat covers what fires none of these. */
+    document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible") {
+            sendVisibility(true);
+            onVisible();
+        } else {
+            sendVisibility(false);
+        }
+    });
+    /* A reload/close hides the page then tears it down; latch that so the
+     * hidden->SUSPEND path bails. Freezing a leaving page only strands the
+     * freeze for the next page to race-undo (the blank-on-reload bug). */
+    window.addEventListener("pagehide", function () { pageUnloading = true; });
+    window.addEventListener("beforeunload", function () { pageUnloading = true; });
+    window.addEventListener("pageshow", function () { pageUnloading = false; onVisible(); });
+    window.addEventListener("online", reconnectNow);
+    window.addEventListener("offline", handleConnectionLost);
+    startHeartbeat();
 
     window.onresize = function(ev) {
         sendScreenSizeChanged();
@@ -3316,6 +4932,319 @@ function start()
                         }
                     });
     sendScreenSizeChanged();
+}
+
+/* ---- Auto-reconnect + session liveness --------------------------------
+ * Mobile browsers suspend the WebSocket on screen-off / network change. We
+ * reconnect in place (no reload), keeping the last frame dimmed under a spinner
+ * until the resync repaints. The daemon's SESSION token tells us whether it is
+ * the same session (resume) or restarted; an unchanged token resumes, a changed
+ * token or DISCONNECTED shows the disconnected icon until refresh. */
+
+var RECONNECT_SPINNER_SVG =
+    '<svg width="64" height="64" viewBox="0 0 50 50" aria-label="reconnecting">' +
+    '<circle cx="25" cy="25" r="20" fill="none" stroke="rgba(255,255,255,0.25)" stroke-width="5"/>' +
+    '<path d="M25 5 a20 20 0 0 1 0 40" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round">' +
+    '<animateTransform attributeName="transform" type="rotate" from="0 25 25" to="360 25 25" dur="0.9s" repeatCount="indefinite"/>' +
+    '</path></svg>';
+
+var DISCONNECTED_SVG =
+    '<svg width="64" height="64" viewBox="0 0 24 24" aria-label="disconnected" fill="#fff">' +
+    '<path d="M17 7h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1 0 1.43-.98 2.63-2.31 2.98l1.46 1.46' +
+    'C20.88 15.61 22 13.95 22 12c0-2.76-2.24-5-5-5zm-1 4h-2.19l2 2H16zM2 4.27l3.11 3.11' +
+    'C3.29 8.12 2 9.91 2 12c0 2.76 2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1 0-1.59 1.21-2.9 2.76-3.07' +
+    'L8.73 11H8v2h2.73L13 15.27V17h1.73l4.01 4.01 1.41-1.41L3.41 2.86 2 4.27zM11 13v-.73L11.73 13H11z"/>' +
+    '</svg>';
+
+function showOverlay(kind)
+{
+    if (!overlayEl) {
+        overlayEl = document.createElement("div");
+        var s = overlayEl.style;
+        s.position = "fixed";
+        s.left = s.top = s.right = s.bottom = "0";
+        s.width = "100vw";
+        s.height = "100vh";
+        s.background = "rgba(0,0,0,0.66)";
+        s.zIndex = "2147483647";
+        s.display = "flex";
+        s.alignItems = "center";
+        s.justifyContent = "center";
+        s.pointerEvents = "auto";   /* swallow input while overlaid */
+        document.body.appendChild(overlayEl);
+    }
+    overlayEl.innerHTML = (kind === "disconnected") ? DISCONNECTED_SVG : RECONNECT_SPINNER_SVG;
+}
+
+function hideOverlay()
+{
+    if (overlayEl && overlayEl.parentNode)
+        overlayEl.parentNode.removeChild(overlayEl);
+    overlayEl = null;
+}
+
+/* Drop all surfaces/textures so the daemon's resync can rebuild from scratch.
+ * cmdCreateSurface is not idempotent, so we must clear before NEW_SURFACE. */
+function resetClientState()
+{
+    /* Drop commands queued on the dead socket so they can't drain (against now
+     * stale surface ids) before the resync repopulates state. */
+    outstandingCommands.length = 0;
+    outstandingDisplayCommands = null;
+    for (var id in surfaces) {
+        var s = surfaces[id];
+        if (s && s.div && s.div.parentNode)
+            s.div.parentNode.removeChild(s.div);
+    }
+    surfaces = {};
+    stackingOrder = [];
+    if (modalScrim)
+        modalScrim.style.display = "none";
+    for (var tid in textures) {
+        var t = textures[tid];
+        if (t && t.url && t.url.indexOf("blob") == 0)
+            window.URL.revokeObjectURL(t.url);
+    }
+    textures = {};
+    surfaceWithMouse = 0;
+    realSurfaceWithMouse = 0;
+    firstTouchDownId = null;
+    firstTouchDownRawId = null;
+    activeTouches = {};
+    touchSurfaceIds = {};
+    pinchActive = false;
+    suppressTouchForward = false;
+    /* A grab held at disconnect may point at a dead surface id and would route
+     * all input there; the daemon replays the whole grab stack after the resync. */
+    grabStack = [];
+    updateGrabCache();
+    lastState = 0;
+    pendingMove = null;
+}
+
+function onSessionToken(token, cid)
+{
+    clientId = cid;
+
+    var firstTime = (sessionToken === null);
+    if (firstTime)
+        sessionToken = token;
+
+    if (firstTime || token === sessionToken) {
+        /* Same session (or first connect): resume in place. A confirmed session is
+         * the real success signal, so reset the reconnect backoff here (not on raw
+         * socket open) - that's what keeps a flapping network from looping. */
+        reconnectDelay = 0;
+        if (reconnecting) {
+            if (!firstTime)
+                resetClientState();
+            awaitFirstFrame = true;    /* overlay drops on the first repaint */
+            /* Keep a single timer so a stale resume can't strand the spinner. */
+            if (resumeSafetyTimer)
+                clearTimeout(resumeSafetyTimer);
+            resumeSafetyTimer = setTimeout(function () {
+                resumeSafetyTimer = null;
+                /* Only on a live socket: if the link dropped again, the
+                 * overlay must stay up and `reconnecting` must stay true. */
+                if (reconnecting && ws && ws.readyState === WebSocket.OPEN) {
+                    reconnecting = false;
+                    awaitFirstFrame = false;
+                    hideOverlay();
+                }
+            }, 3000);
+        }
+        return;
+    }
+
+    invalidateSession();               /* token changed -> daemon restarted */
+}
+
+function invalidateSession()
+{
+    sessionInvalidated = true;
+    reconnecting = false;
+    awaitFirstFrame = false;
+    inputSocket = null;
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    if (resumeSafetyTimer) {
+        clearTimeout(resumeSafetyTimer);
+        resumeSafetyTimer = null;
+    }
+    /* Close the socket so we don't linger on the daemon. */
+    if (ws) {
+        try {
+            ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+            ws.close();
+        } catch (e) { }
+        ws = null;
+    }
+    /* Drop queued messages from the dead session. */
+    outstandingCommands.length = 0;
+    outstandingDisplayCommands = null;
+    showOverlay("disconnected");
+}
+
+function scheduleReconnect()
+{
+    if (sessionInvalidated || reconnectTimer)
+        return;
+    reconnectDelay = reconnectDelay ? Math.min(reconnectDelay * 2, 4000) : 250;
+    reconnectTimer = setTimeout(function () {
+        reconnectTimer = null;
+        connect();
+    }, reconnectDelay);
+}
+
+/* Link is (probably) gone: show the overlay and start retrying. Covers onclose,
+ * the offline event, and a stale heartbeat (socket may still report OPEN). */
+function handleConnectionLost()
+{
+    if (sessionInvalidated)
+        return;
+    inputSocket = null;
+    if (!reconnecting) {
+        reconnecting = true;
+        showOverlay("reconnecting");
+    }
+    /* Disarm any pending resume (first-frame rAF / safety timer) from a prior
+     * session: firing now would clear `reconnecting` and drop the overlay
+     * while the link is down, and the next resume would then skip
+     * resetClientState. */
+    awaitFirstFrame = false;
+    if (resumeSafetyTimer) {
+        clearTimeout(resumeSafetyTimer);
+        resumeSafetyTimer = null;
+    }
+    /* Drop the possibly half-open socket so the next connect() is clean. */
+    if (ws) {
+        try {
+            ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+            ws.close();
+        } catch (e) { }
+        ws = null;
+    }
+    scheduleReconnect();
+}
+
+/* Force an immediate attempt now (network came back / tab foregrounded). */
+function reconnectNow()
+{
+    if (sessionInvalidated)
+        return;
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    reconnectDelay = 0;
+    if (!reconnecting) {
+        reconnecting = true;
+        showOverlay("reconnecting");
+    }
+    connect();   /* connect() tears down any existing socket first */
+}
+
+/* Tab visible again: reset lastPongTime so a stale background value doesn't trip
+ * the heartbeat, then reconnect only if the link looks down. */
+function onVisible()
+{
+    lastPongTime = Date.now();
+    reconnectIfDown();
+}
+
+/* Tell GTK to freeze (visible=false) or thaw (visible=true) rendering so a
+ * backgrounded tab streams no frames. Only meaningful on a live socket: if the
+ * link is down, RESUME is moot (the reconnect resync repaints anyway) and
+ * SUSPEND is moot (nothing is being sent). Guarded against redundant sends so
+ * we don't spam the daemon on rapid focus toggles.
+ *
+ * SUSPEND is DEBOUNCED and skipped while unloading: a reload/close fires
+ * visibilitychange->hidden, but freezing then is harmful - the socket dies in
+ * ms and the freeze outlives the page, so the next page must win a cross-socket
+ * race with its RESUME to thaw. Lose that race (lingering old socket on
+ * Firefox/Chromium) and the fresh page stays frozen = blank. So only a tab that
+ * really stays hidden (survives the debounce, not unloading) suspends. */
+function flushSuspend(suspend)
+{
+    if (tabSuspended === suspend)
+        return;                    /* already in the requested state */
+    if (!ws || ws.readyState !== WebSocket.OPEN || inputSocket == null)
+        return;                    /* can't signal now; ws.onopen re-asserts on reconnect */
+    tabSuspended = suspend;        /* only flip once the signal is actually out */
+    sendInput(suspend ? BROADWAY_EVENT_SUSPEND : BROADWAY_EVENT_RESUME, []);
+}
+
+function sendVisibility(visible)
+{
+    if (suspendTimer) {            /* a visibility change cancels any pending suspend */
+        clearTimeout(suspendTimer);
+        suspendTimer = null;
+    }
+    if (visible) {
+        flushSuspend(false);       /* thaw immediately */
+        return;
+    }
+    if (tabSuspended || pageUnloading)
+        return;                    /* already frozen, or the page is on its way out */
+    suspendTimer = setTimeout(function () {
+        suspendTimer = null;
+        /* Bail if we became visible again or the page is now leaving. */
+        if (document.visibilityState === "visible" || pageUnloading)
+            return;
+        flushSuspend(true);
+    }, SUSPEND_DEBOUNCE_MS);
+}
+
+/* Reconnect only if the link looks down, so a tab switch on a healthy socket
+ * doesn't force a needless resync. */
+function reconnectIfDown()
+{
+    if (sessionInvalidated)
+        return;
+    if (!navigator.onLine) {
+        handleConnectionLost();
+        return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN || inputSocket == null)
+        reconnectNow();
+}
+
+function startHeartbeat()
+{
+    if (heartbeatTimer)
+        return;
+    lastPongTime = Date.now();
+    heartbeatTimer = setInterval(heartbeatTick, HEARTBEAT_MS);
+}
+
+function heartbeatTick()
+{
+    if (sessionInvalidated)
+        return;
+    if (document.hidden)           /* screen off: timers freeze anyway */
+        return;
+    if (reconnecting && (!ws || ws.readyState !== WebSocket.OPEN))
+        return;                    /* still reopening: let the retry loop drive */
+    if (!navigator.onLine ||
+        !ws || ws.readyState !== WebSocket.OPEN || inputSocket == null) {
+        handleConnectionLost();
+        return;
+    }
+    /* No PONG in a while: dead link, or a socket that opened but never got its
+     * SESSION (data path wedged with no onclose). A socket still waiting on
+     * its first message gets the long timeout: killing it mid-resync would
+     * just retrigger the same full resync, forever on a slow link. */
+    if (Date.now() - lastPongTime >
+        (awaitingFirstMessage ? FIRST_MESSAGE_TIMEOUT_MS : HEARTBEAT_TIMEOUT_MS)) {
+        handleConnectionLost();
+        return;
+    }
+    if (!reconnecting) {
+        pingSentTime = Date.now();
+        sendInput(BROADWAY_EVENT_PING, [lastRtt]);
+    }
 }
 
 function connect()
@@ -3334,30 +5263,154 @@ function connect()
 
     var loc = window.location.toString().replace("http:", "ws:").replace("https:", "wss:");
     loc = loc.substr(0, loc.lastIndexOf('/')) + "/socket";
+    /* cid lets the daemon resume us if we still own the display; a fresh load
+     * (clientId 0) omits it and takes over. */
+    if (clientId)
+        loc += (loc.indexOf("?") < 0 ? "?" : "&") + "cid=" + clientId;
+
+    /* Drop any previous socket without letting its onclose drive a second
+     * reconnect (e.g. reconnectNow() pre-empting a suspended one). */
+    if (ws) {
+        try {
+            ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+            ws.close();
+        } catch (e) { }
+    }
+
     ws = new WebSocket(loc, "broadway");
     ws.binaryType = "arraybuffer";
 
     ws.onopen = function() {
         inputSocket = ws;
+        lastPongTime = Date.now(); /* fresh socket: don't immediately time out */
+        awaitingFirstMessage = true;
+        /* Backoff is NOT reset here. A raw socket open is not a working session:
+         * after a network switch the daemon may reject/close us (lost ownership,
+         * or a flaky path drops the socket before SESSION). Resetting here would
+         * make open-then-close flapping retry forever at the 250ms floor. The
+         * reset lives in onSessionToken, gated on a confirmed resume. */
+        /* The app<->daemon link never dropped, so GTK keeps whatever freeze
+         * state a prior socket left it in - and that state is GLOBAL to the app,
+         * possibly set by a different client/session. Our local tabSuspended is
+         * per-client (starts false on a fresh page), so it can't tell us the
+         * app's real state. Assert our visibility UNCONDITIONALLY on every fresh
+         * socket: a visible tab always RESUMEs (idempotent if already running),
+         * so an app left frozen by a vanished background client gets thawed; a
+         * hidden tab always SUSPENDs. */
+        if (document.visibilityState === "visible") {
+            tabSuspended = false;
+            sendInput(BROADWAY_EVENT_RESUME, []);
+        } else {
+            tabSuspended = true;
+            sendInput(BROADWAY_EVENT_SUSPEND, []);
+        }
+        /* Report the browser theme (and re-report after a reconnect); then follow
+         * live changes. */
+        sendColorScheme();
+        watchColorScheme();
+        sendReducedMotion();
+        watchReducedMotion();
+    };
+    ws.onerror = function() {
+        /* onclose follows and drives the reconnect. */
     };
     ws.onclose = function() {
-        if (inputSocket != null)
-            alert ("disconnected");
-        inputSocket = null;
+        /* Also disarms a pending resume rAF/safety timer. */
+        handleConnectionLost();
     };
     ws.onmessage = function(event) {
         handleMessage(event.data);
     };
 
-    var iOS = /(iPad|iPhone|iPod)/g.test( navigator.userAgent );
-    if (iOS || isAndroidChrome) {
+    /* On touch devices, summon the on-screen keyboard by focusing this hidden
+     * input when GTK asks for keyboard input (see updateKeyboardStatus). Not
+     * iOS-only: Android needs it too, or the OSK never appears.
+     * Guarded against reconnects creating a second input. */
+    if (isTouchDevice() && fakeInput == null) {
         fakeInput = document.createElement("input");
         fakeInput.type = "text";
+        fakeInput.setAttribute("autocapitalize", "off");
+        fakeInput.setAttribute("autocomplete", "off");
+        fakeInput.setAttribute("autocorrect", "off");
+        fakeInput.spellcheck = false;
         fakeInput.style.position = "absolute";
         fakeInput.style.left = "-1000px";
         fakeInput.style.top = "-1000px";
         document.body.appendChild(fakeInput);
-	if (isAndroidChrome)
-	    fakeInput.addEventListener('input', onInput, passiveSupported ? { passive: false, capture: false } : false);
+
+        /* The OSK input doubles as the clipboard surface on touch: while focused
+         * it catches a system paste (e.g. Gboard's clipboard chip) as a native
+         * 'paste'/'beforeinput', and serves as copyViaTextarea()'s copy target. */
+        clipboardArea = fakeInput;
+        fakeInput.addEventListener("paste", function (ev) {
+            var t = "";
+            if (ev.clipboardData && ev.clipboardData.getData)
+                t = ev.clipboardData.getData("text/plain");
+            capturePaste(t);
+            ev.preventDefault();
+        });
+        fakeInput.addEventListener("beforeinput", function (ev) {
+            if (ev.inputType === "insertFromPaste") {
+                /* Skip if the 'paste' event already handled this. */
+                if (Date.now() - lastPasteForwardTime < INPUT_ECHO_WINDOW_MS)
+                    return;
+                var t = ev.data;
+                if (t == null && ev.dataTransfer && ev.dataTransfer.getData)
+                    t = ev.dataTransfer.getData("text/plain");
+                capturePaste(t);
+                ev.preventDefault();
+                return;
+            }
+            /* Typed text that produced no usable keyPress (non-Latin layouts,
+             * autocorrect/suggestion replacements, dead keys): GBoard reports a
+             * keyCode-229 keydown we drop, and the character arrives only here.
+             * Composition (insertCompositionText) is handled on compositionend. */
+            if (imeComposing)
+                return;
+            /* OSK backspace/delete also arrive only as keyCode-229 keydowns;
+             * the usable signal is this beforeinput. Forward a key pair and
+             * keep the space buffer intact. */
+            if (ev.inputType === "deleteContentBackward" ||
+                ev.inputType === "deleteContentForward") {
+                var keysym = (ev.inputType === "deleteContentBackward") ? 0xFF08 : 0xFFFF;
+                var state = lastState & ~(GDK_SHIFT_MASK|GDK_CONTROL_MASK|GDK_ALT_MASK);
+                sendInput(BROADWAY_EVENT_KEY_PRESS, [keysym, state]);
+                sendInput(BROADWAY_EVENT_KEY_RELEASE, [keysym, state]);
+                ev.preventDefault();
+                return;
+            }
+            if (ev.inputType === "insertText" ||
+                ev.inputType === "insertReplacementText") {
+                /* Latin keys fire both keyPress and beforeinput; don't re-send the
+                 * same char the keyPress already forwarded (matched by value, so a
+                 * genuinely different char is never suppressed). */
+                if (ev.data === lastKeyPressText &&
+                    Date.now() - lastKeyPressTime < INPUT_ECHO_WINDOW_MS)
+                    return;
+                /* Likewise for a composition just committed via compositionend. */
+                if (ev.data === lastCompositionText &&
+                    Date.now() - lastCompositionEndTime < INPUT_ECHO_WINDOW_MS)
+                    return;
+                if (ev.data) {
+                    commitTextToGtk(ev.data);
+                    resetFakeInputValue();
+                }
+                ev.preventDefault();
+            }
+        });
+        /* IME composition (CJK, gesture typing): commit the final string once,
+         * on compositionend - Broadway has no preedit, so intermediate updates
+         * are not forwarded. */
+        fakeInput.addEventListener("compositionstart", function () {
+            imeComposing = true;
+        });
+        fakeInput.addEventListener("compositionend", function (ev) {
+            imeComposing = false;
+            lastCompositionEndTime = Date.now();
+            lastCompositionText = ev.data || "";
+            if (ev.data)
+                commitTextToGtk(ev.data);
+            resetFakeInputValue();
+        });
     }
 }
